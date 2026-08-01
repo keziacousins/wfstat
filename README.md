@@ -1,5 +1,7 @@
 # wfstat
 
+[![CI](https://github.com/keziacousins/wfstat/actions/workflows/ci.yml/badge.svg)](https://github.com/keziacousins/wfstat/actions/workflows/ci.yml)
+
 Visibility into [Claude Code](https://claude.com/claude-code) **Workflow** runs — historical and live.
 
 Claude Code's `Workflow` tool can fan out dozens of subagents across many phases. While a run is in
@@ -92,7 +94,8 @@ python3 -m unittest discover tests -v
 ```
 
 The tests build a synthetic `CLAUDE_HOME` fixture tree and run the CLI end to end as a subprocess.
-No dependencies, no network, nothing touched outside a temp directory.
+No dependencies, no network, nothing touched outside a temp directory. CI runs them on Linux and
+macOS against Python 3.9, 3.11 and 3.13, and checks that the packaged console script resolves.
 
 ## License
 
