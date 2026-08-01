@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wfstat"
+version = "0.1.0"
+description = "Visibility into Claude Code Workflow runs — token accounting, live agent status, per-agent transcripts."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "Kezia Cousins" }]
+keywords = ["claude", "claude-code", "workflow", "observability", "tokens", "cli"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/keziacousins/wfstat"
+Issues = "https://github.com/keziacousins/wfstat/issues"
+
+[project.scripts]
+wfstat = "wfstat:main"
+
+[tool.setuptools]
+py-modules = ["wfstat"]
