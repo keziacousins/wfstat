@@ -44,10 +44,15 @@ chmod +x ~/.local/bin/wfstat
 | `wfstat show <runId>` | Per-model and per-agent token breakdown for one run, plus cache hit rate. Prefixes work. |
 | `wfstat agent <id>` | One agent's task prompt, return value, token usage, tools used, files touched. Prefixes work. |
 | `wfstat live` | In-flight runs only: per-agent live token totals, idle time, and done/running/orphaned state. |
-| `wfstat watch` | `live` on a flicker-free 2s refresh loop until Ctrl-C. `--interval` to change. |
+| `wfstat watch` | `live` on a flicker-free 2s refresh loop until Ctrl-C, fitted to the window. `--interval` to change. |
 
 Global flags: `--project <abs path or encoded dir name>` to target a project other than the current
 directory, `--all` to scan every project. `wfstat agent --full` prints untruncated task/result text.
+
+Every command fits its output to the terminal. Tables shed their least actionable columns as the
+window narrows (`CACHE-R` goes before `STATE`); status lines wrap onto continuation lines instead,
+since the numbers on them are the point. Redirected output is never clamped, so `wfstat live | less`
+keeps every column — set `COLUMNS` to pin a width explicitly.
 
 By default the project is auto-detected by walking up from `$PWD` to the nearest ancestor that has a
 Claude project directory, so it works from any subdirectory.
@@ -67,7 +72,7 @@ Token figures are summed from the `message.usage` blocks in the agent transcript
 real billed numbers rather than the summary's rounded total — and they are available *during* a run,
 before any summary exists.
 
-## Three things it gets right that the raw files don't
+## Four things it gets right that the raw files don't
 
 These are the reasons the tool exists; each is a trap the on-disk data sets for you.
 
@@ -80,6 +85,14 @@ trailing logs, and reports `⚠ halted` with the reason.
 from its earlier halt while actively appending new agents. Liveness is therefore decided by recent
 write activity, not by absence of a summary — a run is live if something was written in the last five
 minutes and no summary landed *after* that write.
+
+**A frame taller than the window corrupts a live display.** `wfstat watch` repaints in place from
+the cursor home position, which only works while the frame fits: paint past the last row and the
+terminal scrolls, so the next repaint lands mid-frame and stitches frames together. `watch` therefore
+runs on the alternate screen (leaving your scrollback untouched) and clamps each frame to the window.
+When agents don't all fit, in-flight ones keep their seats — a *stalled* agent sorts last by recency
+and is exactly what you need to see — and finished ones collapse into a count, so a short frame never
+reads as though it were the whole picture.
 
 **"Started with no result" does not mean "still running".** A stop-then-restart leaves the interrupted
 agent started-forever, while the engine re-issues that step as a *new* agent id sharing the same
@@ -96,6 +109,29 @@ python3 -m unittest discover tests -v
 The tests build a synthetic `CLAUDE_HOME` fixture tree and run the CLI end to end as a subprocess.
 No dependencies, no network, nothing touched outside a temp directory. CI runs them on Linux and
 macOS against Python 3.9, 3.11 and 3.13, and checks that the packaged console script resolves.
+
+## Releasing
+
+Versions follow [semver](https://semver.org). What the version promises is the **CLI surface** —
+command names, flags, output shape. The on-disk layout `wfstat` reads belongs to Claude Code and can
+change under us; when it does, the fix ships as a patch.
+
+There is one source of truth for the version: `__version__` in `wfstat.py`. `pyproject.toml` reads it
+from there, so they cannot drift. A release is a tag — `pipx install git+…@v1.1.0` resolves to it —
+and CI refuses any tag whose name disagrees with `__version__` or that has no changelog entry.
+
+```sh
+# 1. bump __version__ in wfstat.py, move Unreleased -> the new version in CHANGELOG.md
+# 2. commit, then tag and push
+git tag -a v1.1.0 -m "wfstat 1.1.0 — terminal-aware output"
+git push origin main --follow-tags
+# 3. cut the GitHub release from the changelog section
+gh release create v1.1.0 --title "wfstat 1.1.0" \
+  --notes-file <(awk '/^## \[1.1.0\]/{f=1;next} /^## \[/{f=0} f' CHANGELOG.md)
+```
+
+Tags are annotated, never moved, and never deleted once pushed — someone may have pinned one.
+A mistake gets a new patch release, not a retagged old one.
 
 ## License
 

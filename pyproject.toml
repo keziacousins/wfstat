@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wfstat"
-version = "0.1.0"
+# Single source of truth is wfstat.__version__ — the file has to carry its own
+# version anyway, since dropping it bare on $PATH is a supported install.
+dynamic = ["version"]
 description = "Visibility into Claude Code Workflow runs — token accounting, live agent status, per-agent transcripts."
 readme = "README.md"
 license = { text = "MIT" }
@@ -29,3 +31,6 @@ wfstat = "wfstat:main"
 
 [tool.setuptools]
 py-modules = ["wfstat"]
+
+[tool.setuptools.dynamic]
+version = { attr = "wfstat.__version__" }

@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -144,7 +145,7 @@ class Fixture:
                                 separators=(",", ":")) + "\n")
 
 
-class CLITest(unittest.TestCase):
+class FixtureCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
@@ -154,13 +155,22 @@ class CLITest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_cli(self, *args):
+    def run_cli(self, *args, cols=None):
         env = dict(os.environ, CLAUDE_HOME=self.tmp.name)
+        # Output goes to a pipe, so wfstat leaves it unclamped unless COLUMNS
+        # says otherwise — drop any inherited value so the width of whatever
+        # terminal the suite is run from can't change what the tests see.
+        env.pop("COLUMNS", None)
+        env.pop("LINES", None)
+        if cols:
+            env["COLUMNS"] = str(cols)
         p = subprocess.run([sys.executable, str(SCRIPT), *args, f"--project={ENCODED}"],
                            capture_output=True, text=True, env=env)
         self.assertEqual(p.returncode, 0, msg=p.stderr)
         return p.stdout
 
+
+class CLITest(FixtureCase):
     # -- ls ------------------------------------------------------------------
     def test_ls_lists_both_runs(self):
         out = self.run_cli("ls")
@@ -238,6 +248,174 @@ class CLITest(unittest.TestCase):
         # the completed run's summary was written after its transcripts
         out = self.run_cli("live")
         self.assertNotIn("review-changes", out)
+
+
+def fake_run(n_running, n_done, rid="wf_fake00000001", done_first=False):
+    """A live-run dict shaped like live_runs() returns, without the disk.
+
+    `done_first` hands the finished agents the freshest timestamps, so a naive
+    keep-the-top-N would bury every in-flight agent."""
+    order = ["done"] * n_done + ["running"] * n_running if done_first else \
+            ["running"] * n_running + ["done"] * n_done
+    rows, states = [], {}
+    for pos, st in enumerate(order):
+        aid = f"{pos:08d}"
+        states[aid] = st
+        # descending ts: freshest first, exactly as live_runs() sorts
+        rows.append({"id": aid, "model": "claude-sonnet-5", "usage": wfstat.blank(),
+                     "ts": 2_000_000_000 - pos, "state": st, "label": f"step:{pos}"})
+    return {"rid": rid, "session": "ses-0001", "states": states, "rows": rows,
+            "total": wfstat.blank(), "newest": time.time()}
+
+
+def big_live_run(fx, rid, n_done, n_running):
+    """An in-flight run with more agents than any sane window can hold."""
+    rd = fx.rundir(rid)
+    journal = []
+    for i in range(n_done + n_running):
+        aid = f"{i:08d}"
+        jsonl(rd / f"agent-{aid}.jsonl", [
+            {"type": "user", "message": {"content": "task"}},
+            assistant("claude-sonnet-5", iso(3 + i * 7),
+                      input_tokens=100 * i, output_tokens=10 * i)])
+        journal.append({"type": "started", "agentId": aid, "key": f"k{i}"})
+        if i < n_done:      # the freshest agents are the finished ones
+            journal.append({"type": "result", "agentId": aid,
+                            "key": f"k{i}", "result": "ok"})
+    jsonl(rd / "journal.jsonl", journal)
+
+
+class WidthTest(FixtureCase):
+    """No line may exceed the terminal width, and nothing may vanish silently."""
+
+    COMMANDS = (("ls",), ("show", "wf_donerun0001"), ("agent", "aaaa"), ("live",))
+
+    def test_no_command_overflows_the_terminal_width(self):
+        for cols in (40, 60, 80, 100, 132):
+            for cmd in self.COMMANDS:
+                out = self.run_cli(*cmd, cols=cols)
+                over = [ln for ln in out.split("\n") if len(ln) > cols]
+                self.assertEqual(over, [], f"{cmd} at {cols} cols overflowed")
+
+    def test_piped_output_is_not_clamped(self):
+        # A pipe has no width to respect: `wfstat live | less` must keep every
+        # column, including the ones an 80-column terminal would drop.
+        wide = self.run_cli("live")
+        self.assertIn("CACHE-R", wide)
+        self.assertIn("AGENT", wide)
+        self.assertNotIn("…", wide.split("\n")[0])
+
+    def test_narrow_terminal_drops_columns_rather_than_wrapping_rows(self):
+        narrow, wide = self.run_cli("live", cols=80), self.run_cli("live", cols=120)
+        self.assertIn("CACHE-R", wide)
+        self.assertNotIn("CACHE-R", narrow)   # least actionable column goes first
+        self.assertIn("STATE", narrow)        # the ones you watch for survive
+        self.assertIn("AGENT", narrow)
+
+    def test_status_line_wraps_instead_of_dropping_fields(self):
+        # Every number on the run's status line survives at a width that cannot
+        # hold it on one physical line.
+        out = self.run_cli("live", cols=60)
+        for field in ("started", "done", "in-flight", "orphaned",
+                      "tokens:", "cache-r", "last write:"):
+            self.assertIn(field, out)
+        status = [ln for ln in out.split("\n") if "started" in ln]
+        self.assertTrue(status and all(len(ln) <= 60 for ln in status))
+
+    def test_wrap_fields_keeps_every_field(self):
+        fields = ["alpha: 1", "beta: 22", "gamma: 333", "delta: 4444"]
+        lines = wfstat.wrap_fields(fields, 20, indent="  ")
+        self.assertTrue(len(lines) > 1)
+        self.assertTrue(all(len(ln) <= 20 for ln in lines))
+        joined = " ".join(lines)
+        for f in fields:
+            self.assertIn(f, joined)
+
+    def test_wrap_fields_word_wraps_a_field_wider_than_the_window(self):
+        lines = wfstat.wrap_fields(["agents: 25 started / 8 done / 17 in-flight"], 24)
+        self.assertTrue(all(len(ln) <= 24 for ln in lines))
+        self.assertNotIn("…", " ".join(lines))     # wrapped, not clipped
+        self.assertIn("in-flight", " ".join(lines))
+
+    def test_table_layout_drops_in_order_until_the_flex_column_fits(self):
+        spec = [("NAME", None, "<"), ("A", 10, ">"), ("B", 10, ">"), ("C", 10, ">")]
+        keep, flex = wfstat.table_layout(60, spec, 12, 24, ["C", "B", "A"])
+        self.assertEqual(keep, ["NAME", "A", "B", "C"])   # 60 fits everything
+        keep, flex = wfstat.table_layout(30, spec, 12, 24, ["C", "B", "A"])
+        self.assertEqual(keep, ["NAME", "A"])
+        self.assertGreaterEqual(flex, 12)
+        self.assertLessEqual(wfstat.row_width(spec, keep, flex), 30)
+
+    def test_fit_clips_only_when_it_must(self):
+        self.assertEqual(wfstat.fit("abc", 10), "abc")
+        self.assertEqual(wfstat.fit("abcdef", 4), "abc…")
+        self.assertEqual(len(wfstat.fit("x" * 99, 20)), 20)
+
+
+class FrameTest(FixtureCase):
+    """`watch` frames must fit the window exactly — a frame that scrolls
+    corrupts the in-place repaint on the next tick."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()          # its own tmp tree, so CLITest is unaffected
+        big_live_run(cls.fx, "wf_bigrun00003", n_done=9, n_running=14)
+
+    def pdirs(self):
+        return [Path(self.tmp.name) / "projects" / ENCODED]
+
+    def test_frame_never_exceeds_the_window(self):
+        for cols in (40, 80, 120):
+            for rows in (10, 14, 24, 40):
+                lines = wfstat.live_frame(self.pdirs(), cols, rows).split("\n")
+                self.assertLessEqual(len(lines), rows, f"{cols}x{rows} too tall")
+                self.assertLessEqual(max(len(ln) for ln in lines), cols,
+                                     f"{cols}x{rows} too wide")
+
+    def test_short_window_still_names_the_run_and_admits_what_it_hid(self):
+        lines = wfstat.live_frame(self.pdirs(), 80, 12).split("\n")
+        self.assertTrue(any("wf_bigrun00003" in ln for ln in lines))
+        self.assertTrue(any("hidden" in ln for ln in lines),
+                        "a truncated frame must say so, not read as complete")
+
+    def test_running_agents_outrank_finished_ones_for_scarce_rows(self):
+        # The finished agents are the freshest here, so keeping the top N by
+        # recency alone would show nothing that is still in flight.
+        run = fake_run(n_running=3, n_done=12, done_first=True)
+        lines = wfstat.render_live_run(run, 100, budget=10)
+        self.assertLessEqual(len(lines), 10)
+        shown = [ln for ln in lines if "step:" in ln]
+        self.assertEqual(sum(1 for ln in shown if "running" in ln), 3,
+                         "an in-flight agent lost its seat to a finished one")
+        self.assertTrue(any("done" in ln and "hidden" in ln for ln in lines))
+
+    def test_a_stalled_in_flight_agent_survives_elision(self):
+        # The whole point of `watch`: an agent that started and went quiet
+        # sorts last by recency, and is exactly what you need to see.
+        run = fake_run(n_running=1, n_done=20, done_first=True)
+        lines = wfstat.render_live_run(run, 100, budget=8)
+        self.assertTrue(any("step:20" in ln and "running" in ln for ln in lines),
+                        "the stalled agent was elided")
+
+    def test_rows_stay_most_recent_first(self):
+        run = fake_run(n_running=6, n_done=0)
+        lines = wfstat.render_live_run(run, 100)
+        shown = [ln for ln in lines if "step:" in ln]
+        order = [ln.split("step:")[1].split()[0] for ln in shown]
+        self.assertEqual(order, [str(i) for i in range(6)])
+
+    def test_rows_are_shared_out_rather_than_split_evenly(self):
+        # A small run must not sit on rows a large one could use.
+        big, small = fake_run(20, 0, "wf_big"), fake_run(2, 0, "wf_small")
+        alloc = wfstat._share_rows([len(wfstat.render_live_run(big, 100)) + 1,
+                                    len(wfstat.render_live_run(small, 100)) + 1], 24)
+        self.assertEqual(sum(alloc), 24)
+        self.assertGreater(alloc[0], alloc[1])
+
+    def test_no_live_runs_renders_a_frame_not_an_exception(self):
+        empty = Path(self.tmp.name) / "projects" / "-nonexistent"
+        frame = wfstat.live_frame([empty], 80, 24)
+        self.assertIn("no in-flight", frame)
 
 
 class UnitTest(unittest.TestCase):

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -51,3 +52,29 @@ jobs:
         run: |
           pip install build
           python -m build
+
+  version:
+    # A tag *is* the release here — `pipx install git+…@v1.1.0` resolves to it,
+    # and tags are the one thing you cannot quietly fix after the fact. So the
+    # tag and the code must agree before the release is allowed to stand.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Tag matches __version__
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          code="$(python -c 'import wfstat; print(wfstat.__version__)')"
+          echo "tag=$tag  __version__=$code"
+          if [ "$tag" != "$code" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__ $code"
+            exit 1
+          fi
+
+      - name: Changelog has an entry for this version
+        run: grep -q "^## \[${GITHUB_REF_NAME#v}\]" CHANGELOG.md

@@ -15,12 +15,17 @@ Commands:
   wfstat agent <id>     one agent's task, result, tokens, files touched (prefix ok)
   wfstat live           in-flight runs: per-agent live token totals + elapsed
   wfstat watch          `live` on a 2s refresh loop until Ctrl-C
+
+Output is fitted to the terminal: tables shed their least actionable columns as
+the window narrows, status lines wrap rather than lose fields, and `watch` clamps
+each frame to the window (a frame that scrolls corrupts the in-place repaint).
+Redirected output is left unclamped; set $COLUMNS to pin a width.
 """
-import json, os, sys, glob, time, argparse, io, contextlib
+import json, os, sys, glob, time, argparse, shutil
 from pathlib import Path
 from collections import defaultdict
 
-__version__ = "0.1.0"
+__version__ = "1.1.0"
 
 CLAUDE = Path(os.environ.get("CLAUDE_HOME", Path.home() / ".claude"))
 PROJECTS = CLAUDE / "projects"
@@ -374,7 +379,172 @@ def ago(ts_ms):
     return f"{int(delta)}s ago"
 
 
+# ---- terminal geometry ----------------------------------------------------
+UNBOUNDED = 10 ** 6   # "don't clamp" — what a pipe reports instead of a size
+MIN_COLS, MIN_ROWS = 40, 10
+
+
+def _env_size():
+    """An explicit COLUMNS/LINES override, or None.
+
+    Honoured even when stdout is a pipe — it's how you pin a width for a
+    screenshot, a test, or `COLUMNS=100 wfstat ls | less -R`. A value of 0 (as
+    some shells export) means "unset", matching shutil's own reading."""
+    def val(name):
+        try:
+            return int(os.environ.get(name, ""))
+        except ValueError:
+            return 0
+    cols, rows = val("COLUMNS"), val("LINES")
+    return (cols, rows if rows > 0 else 30) if cols > 0 else None
+
+
+def term_size():
+    """(cols, rows) available for output; unbounded when stdout isn't a tty.
+
+    Redirected output stays unclamped so `wfstat live | less` and the tests see
+    full-width rows — clamping is a display concern, not a data one."""
+    env = _env_size()
+    if env:
+        return max(env[0], MIN_COLS), max(env[1], MIN_ROWS)
+    if not sys.stdout.isatty():
+        return UNBOUNDED, UNBOUNDED
+    sz = shutil.get_terminal_size(fallback=(100, 30))
+    return max(sz.columns, MIN_COLS), max(sz.lines, MIN_ROWS)
+
+
+def fit(s, cols):
+    """Hard-clamp one line so it can never wrap.
+
+    Terminal wrapping is the enemy of in-place repainting: a wrapped line
+    silently costs two rows and outruns the erase-to-EOL that keeps `watch`
+    from flickering."""
+    s = s.rstrip()
+    return s if len(s) <= cols else s[:max(0, cols - 1)] + "…"
+
+
+def _pack(tokens, width, sep):
+    """Greedy line-fill: join `tokens` with `sep`, breaking at `width`."""
+    lines, cur = [], ""
+    for t in tokens:
+        cand = f"{cur}{sep}{t}" if cur else t
+        if cur and len(cand) > width:
+            lines.append(cur)
+            cur = t
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def wrap_fields(fields, cols, indent="", sep="   "):
+    """Greedily pack pre-formatted `key: value` fields, wrapping to `cols`.
+
+    Status lines carry summary numbers you can't sensibly drop, so they wrap
+    onto continuation lines under a hanging indent rather than shedding fields
+    the way the tables below do."""
+    width = max(cols - len(indent), 1)
+    out = []
+    for line in _pack(fields, width, sep):
+        # One field wider than the whole window gets word-wrapped rather than
+        # clipped — the numbers in it are the reason the line exists.
+        out += _pack(line.split(" "), width, " ") if len(line) > width else [line]
+    return [fit(indent + ln, cols) for ln in out]
+
+
+def wrap_text(text, cols, indent=""):
+    """Word-wrap a prose line — same greedy pack, one word per field."""
+    return wrap_fields(text.split(), cols, indent=indent, sep=" ")
+
+
+def table_layout(cols, spec, flex_min, flex_max, drop_order, indent=0):
+    """Decide which columns survive at `cols`, and how wide the flex one gets.
+
+    Unlike a status line a table row must not wrap: a wrapped row costs a
+    second physical line and halves how many agents fit on screen, which is
+    exactly what `watch`'s height budget is trying to protect. So rows shed
+    their least actionable columns instead, in `drop_order`, until the flex
+    column (the one with width None — LABEL / NAME / MODEL) clears `flex_min`.
+
+    `spec` is [(key, width, align)] in display order; each fixed column costs
+    width + 1 for its trailing gap. Returns (surviving keys, flex width)."""
+    dropped = set()
+
+    def slack():
+        return cols - indent - sum(w + 1 for k, w, _a in spec
+                                   if w is not None and k not in dropped)
+
+    for key in drop_order:
+        if slack() >= flex_min:
+            break
+        dropped.add(key)
+    keep = [k for k, _w, _a in spec if k not in dropped]
+    return keep, min(flex_max, max(flex_min, slack()))
+
+
+def render_row(spec, keep, flex_w, values, indent="", cols=None):
+    """One table line: surviving columns only, each clipped to its own width.
+
+    `cols` clamps the finished row — a backstop so a mis-tuned spec or an
+    exhausted drop order can still never produce a wrapping line."""
+    cells = []
+    for key, w, al in spec:
+        if key not in keep:
+            continue
+        w = flex_w if w is None else w
+        cells.append(f"{str(values.get(key, '')):{al}{w}.{w}}")
+    line = (indent + " ".join(cells)).rstrip()
+    return fit(line, cols) if cols else line
+
+
+def row_width(spec, keep, flex_w, indent=0):
+    """Width a full row occupies — measured from the layout, not from the
+    rstripped header, so the rule under a table spans the table."""
+    ws = [flex_w if w is None else w for k, w, _a in spec if k in keep]
+    return indent + sum(ws) + max(len(ws) - 1, 0)
+
+
+def rule(width, cols):
+    return "-" * min(width, cols)
+
+
 # ---- commands -------------------------------------------------------------
+# Column specs: (key, width, align); width None marks the flex column that
+# absorbs whatever slack the terminal leaves. drop_order runs least-actionable
+# first — see table_layout.
+LS_SPEC = [("RUN", 20, "<"), ("NAME", None, "<"), ("STATUS", 10, "<"),
+           ("WHEN", 10, ">"), ("DUR", 7, ">"), ("AGENTS", 7, ">"),
+           ("TOKENS", 8, ">"), ("MODEL", 16, "<")]
+LS_DROP = ["MODEL", "DUR", "AGENTS", "WHEN", "TOKENS", "STATUS"]
+
+SHOW_SPEC = [("MODEL", None, "<"), ("IN", 8, ">"), ("OUT", 8, ">"),
+             ("CACHE-R", 9, ">"), ("CACHE-W", 9, ">"), ("TURNS", 6, ">")]
+SHOW_DROP = ["CACHE-W", "CACHE-R", "TURNS", "IN"]
+
+AGENTS_SPEC = [("LABEL", None, "<"), ("MODEL", 18, "<"), ("IN", 7, ">"),
+               ("OUT", 7, ">"), ("CACHE-R", 8, ">"), ("CACHE-W", 8, ">"),
+               ("TURNS", 6, ">"), ("AGENT", 8, "<")]
+# AGENT is the handle you need to run `wfstat agent <id>`, so it outlives the
+# cache columns rather than being the first thing dropped.
+AGENTS_DROP = ["CACHE-W", "CACHE-R", "IN", "MODEL", "TURNS"]
+
+LIVE_SPEC = [("LABEL", None, "<"), ("MODEL", 18, "<"), ("OUT", 7, ">"),
+             ("IN", 7, ">"), ("CACHE-R", 8, ">"), ("TURNS", 6, ">"),
+             ("IDLE", 6, ">"), ("STATE", 9, "<"), ("AGENT", 8, "<")]
+LIVE_DROP = ["CACHE-R", "IN", "TURNS", "AGENT", "MODEL", "OUT"]
+
+
+def _usage_cells(name, u):
+    """Cells shared by the token tables. The leading column is the flex one in
+    each — MODEL in `show`'s per-model table, LABEL in the per-agent ones — so
+    the name is filled under both keys and callers overwrite MODEL as needed."""
+    return {"MODEL": name, "LABEL": name,
+            "IN": h(u["in"]), "OUT": h(u["out"]),
+            "CACHE-R": h(u["cache_read"]), "CACHE-W": h(u["cache_create"]),
+            "TURNS": u["turns"]}
+
+
 def cmd_ls(args):
     pdirs = project_dirs(args)
     rows = summaries(pdirs)
@@ -386,10 +556,12 @@ def cmd_ls(args):
     if not rows and not live:
         print("no workflow runs found.")
         return
-    hdr = (f"{'RUN':<20} {'NAME':<24} {'STATUS':<10} {'WHEN':>10} {'DUR':>7} "
-           f"{'AGENTS':>7} {'TOKENS':>8} {'MODEL':<16}")
-    print(hdr)
-    print("-" * len(hdr))
+    cols, _rows = term_size()
+    # A legible workflow name outranks DUR/AGENTS: the name is how you pick a
+    # run out of the list, and `show` has the rest.
+    keep, flex = table_layout(cols, LS_SPEC, 16, 24, LS_DROP)
+    print(render_row(LS_SPEC, keep, flex, {k: k for k in keep}, cols=cols))
+    print(rule(row_width(LS_SPEC, keep, flex), cols))
 
     # in-flight first — reconstructed from transcripts (no summary yet)
     for rid, rd, p in live:
@@ -401,24 +573,31 @@ def cmd_ls(args):
         else:
             status = "▶ resumed" if resumed else "▶ running"
         tok = s["total"]["in"] + s["total"]["out"]  # non-cache, comparable to summary
-        agents = f"{len(s['result'])}/{len(s['started'])}"
         model = s["models"][0] if len(s["models"]) == 1 else (
             "mixed" if s["models"] else "-")
-        print(f"{rid:<20.20} {live_run_name(p, rid):<24.24} {status:<10.10} "
-              f"{ago(s['newest']*1000) if s['newest'] else '-':>10} "
-              f"{'—':>7} {agents:>7} {h(tok):>8} {model:<16.16}")
+        print(render_row(LS_SPEC, keep, flex, {
+            "RUN": rid, "NAME": live_run_name(p, rid), "STATUS": status,
+            "WHEN": ago(s["newest"] * 1000) if s["newest"] else "-", "DUR": "—",
+            "AGENTS": f"{len(s['result'])}/{len(s['started'])}",
+            "TOKENS": h(tok), "MODEL": model}, cols=cols))
 
     for rid, _f, d, _p in rows:
         eff, _reason = effective_status(d)
         label = {"halted": "⚠ halted", "killed": "✗ killed",
                  "failed": "✗ failed"}.get(eff, eff)
-        print(f"{rid:<20.20} {d.get('workflowName','?'):<24.24} "
-              f"{label:<10.10} {ago(d.get('startTime')):>10} "
-              f"{dur(d.get('durationMs')):>7} {str(d.get('agentCount','-')):>7} "
-              f"{h(d.get('totalTokens')):>8} {d.get('defaultModel','-'):<16.16}")
+        print(render_row(LS_SPEC, keep, flex, {
+            "RUN": rid, "NAME": d.get("workflowName", "?"), "STATUS": label,
+            "WHEN": ago(d.get("startTime")), "DUR": dur(d.get("durationMs")),
+            "AGENTS": str(d.get("agentCount", "-")),
+            "TOKENS": h(d.get("totalTokens")),
+            "MODEL": d.get("defaultModel", "-")}, cols=cols))
     n = len(rows) + len(live)
     extra = f"  ({len(live)} running)" if live else ""
-    print(f"\n{n} run(s){extra}. `wfstat show <run>` for tokens · `wfstat live` for live agents.")
+    print()
+    print("\n".join(wrap_fields(
+        [f"{n} run(s){extra}.",
+         "`wfstat show <run>` for tokens · `wfstat live` for live agents."],
+        cols, sep=" ")))
 
 
 def _resolve(pdirs, prefix):
@@ -458,56 +637,67 @@ def cmd_show(args):
             if e.get("agentId") and e.get("label"):
                 labels[e["agentId"]] = e["label"]
 
-    print(f"run:   {rid}")
+    cols, _rows = term_size()
+    print(fit(f"run:   {rid}", cols))
     if kind == "done":
         d = payload[1]
         eff, reason = effective_status(d)
         shown = eff if eff == d.get("status") else f"{eff} (raw: {d.get('status')})"
-        print(f"name:  {d.get('workflowName')}   status: {shown}   "
-              f"duration: {dur(d.get('durationMs'))}   agents: {d.get('agentCount')}")
-        print(f"summary totalTokens: {h(d.get('totalTokens'))}   "
-              f"toolCalls: {d.get('totalToolCalls')}   defaultModel: {d.get('defaultModel')}")
+        print("\n".join(wrap_fields(
+            [f"name:  {d.get('workflowName')}", f"status: {shown}",
+             f"duration: {dur(d.get('durationMs'))}",
+             f"agents: {d.get('agentCount')}"], cols)))
+        print("\n".join(wrap_fields(
+            [f"summary totalTokens: {h(d.get('totalTokens'))}",
+             f"toolCalls: {d.get('totalToolCalls')}",
+             f"defaultModel: {d.get('defaultModel')}"], cols)))
         if eff in ("halted", "killed", "failed") and reason:
-            print(f"\n  ⚠ {eff.upper()}: {reason}")
+            print()
+            print("\n".join(wrap_text(f"⚠ {eff.upper()}: {reason}", cols, "  ")))
     else:
-        print("status: LIVE (no summary yet — reconstructed from transcripts)")
+        print("\n".join(wrap_text(
+            "status: LIVE (no summary yet — reconstructed from transcripts)", cols)))
     print()
 
     if not by_model:
         print("  (no real token usage recorded yet)")
         return
 
-    print(f"{'MODEL':<26} {'IN':>8} {'OUT':>8} {'CACHE-R':>9} {'CACHE-W':>9} {'TURNS':>6}")
-    print("-" * 72)
+    keep, flex = table_layout(cols, SHOW_SPEC, 14, 26, SHOW_DROP)
+    print(render_row(SHOW_SPEC, keep, flex, {k: k for k in keep}, cols=cols))
+    print(rule(row_width(SHOW_SPEC, keep, flex), cols))
     grand = blank()
     for m in sorted(by_model):
         u = by_model[m]
         for k, v in u.items():
             grand[k] += v
-        print(f"{m:<26.26} {h(u['in']):>8} {h(u['out']):>8} {h(u['cache_read']):>9} "
-              f"{h(u['cache_create']):>9} {u['turns']:>6}")
-    print("-" * 72)
-    print(f"{'TOTAL':<26} {h(grand['in']):>8} {h(grand['out']):>8} "
-          f"{h(grand['cache_read']):>9} {h(grand['cache_create']):>9} {grand['turns']:>6}")
+        print(render_row(SHOW_SPEC, keep, flex, _usage_cells(m, u), cols=cols))
+    print(rule(row_width(SHOW_SPEC, keep, flex), cols))
+    print(render_row(SHOW_SPEC, keep, flex, _usage_cells("TOTAL", grand), cols=cols))
     billed = grand['in'] + grand['out'] + grand['cache_read'] + grand['cache_create']
     cache_pct = 100 * grand['cache_read'] / billed if billed else 0
-    print(f"\n  wire input ≈ {h(grand['in']+grand['cache_read']+grand['cache_create'])}"
-          f"  |  {cache_pct:.0f}% of input served from cache")
+    print()
+    print("\n".join(wrap_fields(
+        [f"wire input ≈ {h(grand['in']+grand['cache_read']+grand['cache_create'])}",
+         f"{cache_pct:.0f}% of input served from cache"],
+        cols, indent="  ", sep="  |  ")))
 
     if not args.no_agents:
         active = [a for a in per_agent if a[2]['turns']]
         cached = len(per_agent) - len(active)
-        print(f"\nper-agent ({len(active)} with API calls, ranked by output):")
-        print(f"{'LABEL':<26} {'MODEL':<18} {'IN':>7} {'OUT':>7} {'CACHE-R':>8} "
-              f"{'CACHE-W':>8} {'TURNS':>6}  {'AGENT':<8}")
-        print("-" * 92)
+        print()
+        print("\n".join(wrap_text(
+            f"per-agent ({len(active)} with API calls, ranked by output):", cols)))
+        keep, flex = table_layout(cols, AGENTS_SPEC, 12, 26, AGENTS_DROP)
+        print(render_row(AGENTS_SPEC, keep, flex, {k: k for k in keep}, cols=cols))
+        print(rule(row_width(AGENTS_SPEC, keep, flex), cols))
         for aid, model, u, _ts in sorted(active, key=lambda x: -x[2]['out']):
-            lbl = labels.get(aid, f"({aid[:8]})")
-            print(f"{lbl:<26.26} {str(model):<18.18} {h(u['in']):>7} {h(u['out']):>7} "
-                  f"{h(u['cache_read']):>8} {h(u['cache_create']):>8} {u['turns']:>6}  "
-                  f"{aid[:8]:<8}")
+            cells = _usage_cells(labels.get(aid, f"({aid[:8]})"), u)
+            cells.update({"MODEL": str(model), "AGENT": aid[:8]})
+            print(render_row(AGENTS_SPEC, keep, flex, cells, cols=cols))
         if cached:
-            print(f"  (+{cached} resume-cached agent(s): returned from cache, no API calls this run)")
+            print(fit(f"  (+{cached} resume-cached agent(s): returned from cache, "
+                      f"no API calls this run)", cols))
 
 
 def _agent_meta(rundir, agent_id):
@@ -535,17 +725,20 @@ def cmd_agent(args):
     task, tools, files, bash = agent_activity(path)
     result = journal_result(rundir, aid)
 
-    print(f"agent: {aid}")
+    cols, _rows = term_size()
+    print(fit(f"agent: {aid}", cols))
     line = f"run:   {rid}"
     if wfname:
         line += f"  ({wfname})"
-    print(line)
+    print(fit(line, cols))
     if meta:
-        print(f"label: {meta.get('label')}   phase: {meta.get('phaseTitle')}   "
-              f"model: {meta.get('model')}   state: {meta.get('state')}")
-    print(f"tokens: in {h(tot['in'])}  out {h(tot['out'])}  "
-          f"cache-r {h(tot['cache_read'])}  cache-w {h(tot['cache_create'])}  "
-          f"turns {tot['turns']}")
+        print("\n".join(wrap_fields(
+            [f"label: {meta.get('label')}", f"phase: {meta.get('phaseTitle')}",
+             f"model: {meta.get('model')}", f"state: {meta.get('state')}"], cols)))
+    print("\n".join(wrap_fields(
+        [f"tokens: in {h(tot['in'])}  out {h(tot['out'])}",
+         f"cache-r {h(tot['cache_read'])}  cache-w {h(tot['cache_create'])}",
+         f"turns {tot['turns']}"], cols)))
 
     if task:
         print("\n── task ──")
@@ -558,15 +751,17 @@ def cmd_agent(args):
     if tools:
         order = sorted(tools.items(), key=lambda x: -x[1])
         print("\n── activity ──")
-        print("  tools: " + "  ".join(f"{n}×{c}" for n, c in order))
+        print("\n".join(wrap_fields(["tools: " + f"{order[0][0]}×{order[0][1]}"]
+                                    + [f"{n}×{c}" for n, c in order[1:]],
+                                    cols, indent="  ", sep="  ")))
     if files:
         print("  files touched:")
         for f, c in sorted(files.items(), key=lambda x: -x[1]):
-            print(f"    {c:>3}  {f}")
+            print(fit(f"    {c:>3}  {f}", cols))
     if bash and args.full:
         print("  bash (first line of each):")
         for c in bash:
-            print(f"    $ {c}")
+            print(fit(f"    $ {c}", cols))
 
 
 def _squeeze(text, full, cap):
@@ -645,19 +840,23 @@ def live_label_map(rundir):
     return lambda aid: labels.get(aid) or key_label.get(agent_key.get(aid))
 
 
-def cmd_live(args):
-    pdirs = project_dirs(args)
-    found = False
+NO_LIVE = "no in-flight workflow runs. (all runs have completed summaries)"
+
+
+def live_runs(pdirs):
+    """Collect every in-flight run's agent rows, states and totals (no output).
+
+    Split out from the printing so `watch` can budget rows across runs before
+    anything is rendered."""
+    out = []
     for rid, rd, p in live_run_dirs(pdirs):
         agent_files = glob.glob(str(rd / "agent-*.jsonl"))
         if not agent_files:
             continue
-        found = True
-        states, result = journal_states(rd)
+        states, _result = journal_states(rd)
         label_of = live_label_map(rd)
         run_total = blank()
-        rows = []
-        newest = 0.0
+        rows, newest = [], 0.0
         for af in sorted(agent_files):
             bm, last_ts, last_model = scan_agent_file(af)
             newest = max(newest, last_ts)
@@ -666,58 +865,186 @@ def cmd_live(args):
                 for k, v in u.items():
                     tot[k] += v; run_total[k] += v
             aid = Path(af).stem.replace("agent-", "")
-            rows.append((aid, last_model, tot, last_ts, states.get(aid, "running")))
+            rows.append({"id": aid, "model": last_model, "usage": tot,
+                         "ts": last_ts, "state": states.get(aid, "running"),
+                         "label": label_of(aid) or f"({aid[:8]})"})
+        # Most recently active first: the freshest work is anchored to the top
+        # of the window and elision eats from the bottom.
+        rows.sort(key=lambda r: -r["ts"])
+        out.append({"rid": rid, "session": p.name, "states": states,
+                    "rows": rows, "total": run_total, "newest": newest})
+    return out
 
-        n_done = sum(1 for s in states.values() if s == "done")
-        n_run = sum(1 for s in states.values() if s == "running")
-        n_orph = sum(1 for s in states.values() if s == "orphaned")
-        idle = time.time() - newest if newest else None
-        flag = "⚠ stalled?" if (idle and idle > 90) else "● active"
-        print(f"══ {rid}  [{flag}]  {p.name}")
-        orph = f" / {n_orph} orphaned" if n_orph else ""
-        print(f"   agents: {len(states)} started / {n_done} done / "
-              f"{n_run} in-flight{orph}   "
-              f"tokens: in {h(run_total['in'])}  out {h(run_total['out'])}  "
-              f"cache-r {h(run_total['cache_read'])}   "
-              f"last write: {int(idle)}s ago" if idle else "")
-        print(f"   {'LABEL':<24} {'MODEL':<18} {'OUT':>7} {'IN':>7} {'CACHE-R':>8} "
-              f"{'TURNS':>6}  {'IDLE':>6}  {'STATE':<9} {'AGENT':<8}")
-        for aid, model, u, ts, st in sorted(rows, key=lambda x: -x[3]):
-            it = f"{int(time.time()-ts)}s" if ts else "-"
-            lbl = label_of(aid) or f"({aid[:8]})"
-            print(f"   {lbl:<24.24} {str(model):<18.18} {h(u['out']):>7} {h(u['in']):>7} "
-                  f"{h(u['cache_read']):>8} {u['turns']:>6}  {it:>6}  {st:<9} {aid[:8]:<8}")
+
+def render_live_run(run, cols, budget=None):
+    """Lines for one in-flight run, elided from the bottom to `budget` rows.
+
+    `running` agents outrank finished ones for the available seats, however
+    stale. An agent that started and then went quiet sorts to the bottom by
+    recency — and that stalled agent is the most interesting row on the
+    screen — so done/orphaned rows collapse into a count first. Only when the
+    in-flight agents alone overrun the budget do they get cut too, freshest
+    kept, and the note says how many of each state went missing."""
+    states, rows = run["states"], run["rows"]
+    idle = time.time() - run["newest"] if run["newest"] else None
+    flag = "⚠ stalled?" if (idle and idle > 90) else "● active"
+    lines = [fit(f"══ {run['rid']}  [{flag}]  {run['session']}", cols)]
+
+    n = lambda st: sum(1 for s in states.values() if s == st)  # noqa: E731
+    agents = (f"agents: {len(states)} started / {n('done')} done / "
+              f"{n('running')} in-flight")
+    if n("orphaned"):
+        agents += f" / {n('orphaned')} orphaned"
+    t = run["total"]
+    fields = [agents, f"tokens: in {h(t['in'])}  out {h(t['out'])}  "
+                      f"cache-r {h(t['cache_read'])}"]
+    if idle is not None:
+        fields.append(f"last write: {int(idle)}s ago")
+    lines += wrap_fields(fields, cols, indent="   ")
+
+    keep, flex = table_layout(cols, LIVE_SPEC, 12, 24, LIVE_DROP, indent=3)
+    lines.append(render_row(LIVE_SPEC, keep, flex,
+                            {k: k for k in keep}, indent="   ", cols=cols))
+
+    shown, hidden = rows, []
+    if budget is not None and len(lines) + len(rows) > budget:
+        room = max(budget - len(lines) - 1, 1)   # -1 for the elision note
+        inflight = [r for r in rows if r["state"] == "running"]
+        rest = [r for r in rows if r["state"] != "running"]
+        picked = {r["id"] for r in inflight[:room]}
+        picked |= {r["id"] for r in rest[:max(room - len(inflight), 0)]}
+        shown = [r for r in rows if r["id"] in picked]
+        hidden = [r for r in rows if r["id"] not in picked]
+
+    for r in shown:
+        it = f"{int(time.time()-r['ts'])}s" if r["ts"] else "-"
+        u = r["usage"]
+        lines.append(render_row(LIVE_SPEC, keep, flex, {
+            "LABEL": r["label"], "MODEL": str(r["model"]), "OUT": h(u["out"]),
+            "IN": h(u["in"]), "CACHE-R": h(u["cache_read"]),
+            "TURNS": u["turns"], "IDLE": it, "STATE": r["state"],
+            "AGENT": r["id"][:8]}, indent="   ", cols=cols))
+    if hidden:
+        by = defaultdict(int)
+        for r in hidden:
+            by[r["state"]] += 1
+        note = ", ".join(f"+{c} {s}" for s, c in sorted(by.items()))
+        lines.append(fit(f"   … {note} hidden — `wfstat live` for all", cols))
+    return lines
+
+
+def cmd_live(args):
+    runs = live_runs(project_dirs(args))
+    cols, _rows = term_size()
+    if not runs:
+        print("\n".join(wrap_text(NO_LIVE, cols)))
+        return
+    for run in runs:
+        print("\n".join(render_live_run(run, cols)))
         print()
-    if not found:
-        print("no in-flight workflow runs. (all runs have completed summaries)")
+
+
+MIN_RUN_ROWS = 6   # ══ header + status + table header + a row + the elision note
+
+
+def _share_rows(need, total):
+    """Water-fill `total` rows across runs asking for `need` each.
+
+    An even split wastes the window: a two-agent run can't use half the screen
+    while a twenty-agent run is elided beside it. So satisfy the modest askers
+    first and pour what's left over the runs still short."""
+    alloc = [0] * len(need)
+    left, short = total, [i for i, n in enumerate(need) if n]
+    while short and left >= len(short):
+        share = left // len(short)
+        for i in list(short):
+            take = min(need[i] - alloc[i], share)
+            alloc[i] += take
+            left -= take
+            if alloc[i] >= need[i]:
+                short.remove(i)
+    for i in short:                    # hand out the remainder a row at a time
+        if left <= 0:
+            break
+        alloc[i] += 1
+        left -= 1
+    return alloc
+
+
+def live_frame(pdirs, cols, rows):
+    """One `watch` frame, clamped to `rows` lines so it can never scroll.
+
+    The whole in-place repaint depends on the frame fitting: paint past the
+    last row and the terminal scrolls, the frame's top slides away, and the
+    next cursor-home lands mid-frame — which is what shredded the display once
+    output outgrew the window. Runs share the body rows by water-filling; a run
+    that can't clear MIN_RUN_ROWS is dropped for a footer, not half-drawn. Whatever
+    the clamp eats is always accounted for in that footer — a frame that just
+    stopped short would read as "this is everything"."""
+    lines = [fit(f"wfstat live — {time.strftime('%H:%M:%S')}  (Ctrl-C to stop)", cols), ""]
+    runs = live_runs(pdirs)
+    if not runs:
+        lines += wrap_text(NO_LIVE, cols)
+        return "\n".join(lines[:rows])
+    need = [len(render_live_run(r, cols)) + 1 for r in runs]   # +1 trailing blank
+    body = rows - len(lines)
+    if sum(need) <= body:
+        shown, lost_runs, alloc = len(runs), 0, need
+    else:
+        # Show only as many runs as can each clear MIN_RUN_ROWS — a two-line
+        # stub of a run tells you nothing the footer's count doesn't. The
+        # newest run always gets a slot, however small the window.
+        shown = max(1, min(len(runs), (body - 1) // MIN_RUN_ROWS))
+        lost_runs = len(runs) - shown
+        alloc = _share_rows(need[:shown], max(body - (1 if lost_runs else 0), 0))
+    for run, a in zip(runs[:shown], alloc):
+        lines += render_live_run(run, cols, a - 1) + [""]
+    while lines and not lines[-1]:
+        lines.pop()
+    if lost_runs or len(lines) > rows:
+        lost_rows = max(len(lines) - (rows - 1), 0)
+        lines = lines[:rows - 1]
+        note = " and ".join(([f"+{lost_rows} row(s)"] if lost_rows else [])
+                            + ([f"+{lost_runs} run(s)"] if lost_runs else []))
+        lines.append(fit(f"… {note} hidden — resize or `wfstat live`", cols))
+    return "\n".join(lines[:rows])
 
 
 def cmd_watch(args):
-    # Flicker-free: render the whole frame into a buffer *before* touching the
-    # screen, then repaint in place (cursor home + erase-to-EOL per line +
-    # erase-below) instead of a blanking clear. Wrap each repaint in the DEC
-    # synchronized-output markers (2026h/l) so terminals that support them draw
-    # the frame atomically; others ignore the unknown private mode.
+    # `watch` takes over the screen. The alternate buffer means a frame can
+    # never scroll and the user's scrollback is left untouched; within it we
+    # repaint in place (cursor home + erase-to-EOL per line + erase-below)
+    # rather than blanking, so the display doesn't flicker. Each repaint is
+    # wrapped in the DEC synchronized-output markers (2026h/l) so terminals
+    # that support them draw the frame atomically; others ignore the mode.
     HIDE, SHOW = "\033[?25l", "\033[?25h"
+    ALT_ON, ALT_OFF = "\033[?1049h", "\033[?1049l"
     SYNC_ON, SYNC_OFF = "\033[?2026h", "\033[?2026l"
-    sys.stdout.write("\033[2J\033[H" + HIDE)  # one clean clear at startup
+    pdirs = project_dirs(args)
+    out, frame, last = sys.stdout, "", None
+    out.write(ALT_ON + HIDE)   # the first frame clears (last is None => resized)
     try:
         while True:
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                print(f"wfstat live — {time.strftime('%H:%M:%S')}  (Ctrl-C to stop)\n")
-                cmd_live(args)
+            cols, rows = term_size()          # re-read: the window may resize
+            if cols == UNBOUNDED:             # piped — no geometry to clamp to
+                cols, rows = 100, 30
+            frame = live_frame(pdirs, cols, rows)
+            # A resize reflows the previous frame into debris the differential
+            # repaint can't reach, so pay for one full clear on that frame.
+            clear, last = ("\033[2J" if last != (cols, rows) else ""), (cols, rows)
             # \033[K erases stale trailing chars from a previously-longer line;
-            # \033[J after the frame erases any lines a shorter frame left behind.
-            painted = "".join(line + "\033[K\n" for line in buf.getvalue().split("\n"))
-            sys.stdout.write(SYNC_ON + "\033[H" + painted + "\033[J" + SYNC_OFF)
-            sys.stdout.flush()
+            # \033[J after the frame erases lines a shorter frame left behind.
+            # No trailing newline — writing one on the last row would scroll.
+            painted = "\n".join(ln + "\033[K" for ln in frame.split("\n"))
+            out.write(SYNC_ON + clear + "\033[H" + painted + "\033[J" + SYNC_OFF)
+            out.flush()
             time.sleep(args.interval)
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout.write(SHOW + "\n")
-        sys.stdout.flush()
+        out.write(SHOW + ALT_OFF)
+        out.write(frame + "\n")   # parting snapshot, on the normal screen
+        out.flush()
 
 
 def main():
