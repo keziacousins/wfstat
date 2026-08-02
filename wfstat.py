@@ -6,6 +6,7 @@ Reads the on-disk artifacts the Workflow engine writes under
     workflows/wf_*.json                         (per-run summary, written at completion)
     subagents/workflows/wf_XXX/journal.jsonl    (started/result events, live)
     subagents/workflows/wf_XXX/agent-*.jsonl    (per-agent transcript w/ message.usage, live)
+    subagents/agent-*.jsonl                     (Agent-tool subagents of the session, live)
 
 No deps beyond the stdlib. Auto-detects the project from $PWD (override with --project / --all).
 
@@ -13,7 +14,7 @@ Commands:
   wfstat ls             historical + in-flight runs, newest first (default)
   wfstat show <runId>   per-model + per-agent token breakdown for one run (prefix ok)
   wfstat agent <id>     one agent's task, result, tokens, files touched (prefix ok)
-  wfstat live           in-flight runs: per-agent live token totals + elapsed
+  wfstat live           in flight now: workflow runs *and* Agent-tool subagents
   wfstat watch          `live` on a 2s refresh loop until Ctrl-C
 
 Output is fitted to the terminal: tables shed their least actionable columns as
@@ -25,7 +26,7 @@ import json, os, sys, glob, time, argparse, shutil
 from pathlib import Path
 from collections import defaultdict
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 CLAUDE = Path(os.environ.get("CLAUDE_HOME", Path.home() / ".claude"))
 PROJECTS = CLAUDE / "projects"
@@ -172,15 +173,19 @@ def journal_result(rundir, agent_id):
 
 
 def find_agent(pdirs, prefix):
-    """Locate an agent transcript by id/prefix. Returns (agent_id, path, rundir)."""
+    """Locate an agent transcript by id/prefix. Returns (agent_id, path, rundir).
+
+    Searches workflow agents and plain Agent-tool subagents alike; the caller
+    tells them apart by whether the returned dir is a wf_* run."""
     hits = []
     for p in pdirs:
-        for f in glob.glob(str(p / "*" / "subagents" / "workflows" / "wf_*"
-                             / f"agent-{prefix}*.jsonl")):
-            if f.endswith(".meta.json"):
-                continue
-            aid = Path(f).stem.replace("agent-", "")
-            hits.append((aid, Path(f), Path(f).parent))
+        for pat in (p / "*" / "subagents" / "workflows" / "wf_*" / f"agent-{prefix}*.jsonl",
+                    p / "*" / "subagents" / f"agent-{prefix}*.jsonl"):
+            for f in glob.glob(str(pat)):
+                if f.endswith(".meta.json"):
+                    continue
+                aid = Path(f).stem.replace("agent-", "")
+                hits.append((aid, Path(f), Path(f).parent))
     uniq = {a: (a, f, r) for a, f, r in hits}  # dedupe by id
     if not uniq:
         sys.exit(f"no agent matching {prefix!r} (try --all across projects)")
@@ -263,14 +268,30 @@ def _newest_activity(rundir):
     return newest
 
 
+def _journal_mtime(rundir):
+    try:
+        return os.path.getmtime(rundir / "journal.jsonl")
+    except OSError:
+        return 0.0
+
+
 def live_run_dirs(pdirs):
     """Yield (rid, rundir, session_dir) for runs writing right now.
 
-    Liveness is decided by *recent write activity*, not by absence of a
-    summary — a resumed run (resumeFromRunId) carries a stale summary from
-    its earlier halt yet is actively appending new agents. A run counts as
-    live when its newest file was written within LIVE_WINDOW and no summary
-    was written *after* that activity (a fresh summary => the run finished)."""
+    Absence of a summary can't decide this: a resumed run (resumeFromRunId)
+    carries a stale summary from its earlier halt yet is actively appending new
+    agents. So a run is live when something was written within LIVE_WINDOW and,
+    if a summary exists, the *journal* has advanced since that summary.
+
+    The journal is the load-bearing part. Only the engine writes it, and only
+    to record an agent starting or returning — so it advances when a resumed
+    run picks up real work, and stays put when a run is over. Comparing the
+    summary against raw file activity instead loses a race: an agent that is
+    still flushing its transcript as the run is killed writes *after* the
+    summary lands, which read as "resumed". That happened — a death rattle
+    101ms late kept a killed run on screen, labelled `⚠ stalled?`, for the
+    full five minutes, and a control session watching it concluded the run was
+    alive and waited on it forever."""
     summ_mtime = {}
     for rid, f, _d, _p in summaries(pdirs):
         try:
@@ -286,9 +307,89 @@ def live_run_dirs(pdirs):
             act = _newest_activity(Path(rd))
             if not act or now - act > LIVE_WINDOW:
                 continue
-            if summ_mtime.get(rid, 0.0) >= act:  # summary written after last write => done
+            smt = summ_mtime.get(rid, 0.0)
+            if smt and _journal_mtime(Path(rd)) <= smt:   # summarised, no new work
                 continue
             yield rid, Path(rd), Path(rd).parents[2]
+
+
+def subagent_meta(path):
+    """The sibling .meta.json for an agent transcript ({} if absent).
+
+    Agent-tool subagents carry the `description` you gave the tool, which is
+    the only human-readable name they ever get — workflow agents get theirs
+    from the run summary instead."""
+    try:
+        return json.load(open(str(path)[:-len(".jsonl")] + ".meta.json"))
+    except (OSError, ValueError):
+        return {}
+
+
+def subagent_state(path):
+    """done / running for an Agent-tool subagent, read from its own transcript.
+
+    These have no journal — nothing on disk records their completion, and the
+    session's tool_result is not it either: an async agent's result says only
+    "launched successfully" and lands immediately. What does distinguish them
+    is the shape of the tail. An agent that has returned ends on an assistant
+    message with stop_reason "end_turn" and no pending tool call; one still in
+    its tool loop does not."""
+    last = None
+    for d in _iter_json(path):
+        if d.get("type") == "assistant":
+            last = d
+    if not last:
+        return "running"
+    msg = last.get("message") or {}
+    pending = any(isinstance(b, dict) and b.get("type") == "tool_use"
+                  for b in msg.get("content") or [])
+    return "done" if msg.get("stop_reason") == "end_turn" and not pending else "running"
+
+
+def session_subagents(pdirs):
+    """Agent-tool subagents that wrote recently, grouped by session.
+
+    These live one level above the workflow runs, at <session>/subagents/, and
+    are invisible to everything else here — a session can be running a dozen of
+    them while `live` reports nothing at all, which makes "nothing in flight"
+    impossible to tell from "nothing I can see"."""
+    now = time.time()
+    out = []
+    for p in pdirs:
+        for sess in sorted(glob.glob(str(p / "*" / "subagents"))):
+            rows, total, newest = [], blank(), 0.0
+            for af in sorted(glob.glob(str(Path(sess) / "agent-*.jsonl"))):
+                try:
+                    mtime = os.path.getmtime(af)
+                except OSError:
+                    continue
+                if now - mtime > LIVE_WINDOW:
+                    continue          # cheap upper bound — skip without parsing
+                bm, last_ts, last_model = scan_agent_file(af)
+                # Filter on the same clock the IDLE column displays. Deciding
+                # liveness by mtime and then showing an age from the transcript
+                # lets the two disagree, which is the whole bug above in
+                # miniature: a row claiming to be live next to "9999s idle".
+                ts = last_ts or mtime
+                if now - ts > LIVE_WINDOW:
+                    continue
+                newest = max(newest, ts)
+                tot = blank()
+                for u in bm.values():
+                    for k, v in u.items():
+                        tot[k] += v
+                        total[k] += v
+                meta = subagent_meta(af)
+                rows.append({"id": Path(af).stem.replace("agent-", ""),
+                             "label": meta.get("description") or "(no description)",
+                             "type": meta.get("agentType", "?"),
+                             "model": meta.get("model") or last_model or "?",
+                             "usage": tot, "ts": ts, "state": subagent_state(af)})
+            if rows:
+                rows.sort(key=lambda r: -r["ts"])
+                out.append({"session": Path(sess).parent.name, "rows": rows,
+                            "total": total, "newest": newest})
+    return out
 
 
 def live_run_name(session_dir, rid):
@@ -534,6 +635,13 @@ LIVE_SPEC = [("LABEL", None, "<"), ("MODEL", 18, "<"), ("OUT", 7, ">"),
              ("IDLE", 6, ">"), ("STATE", 9, "<"), ("AGENT", 8, "<")]
 LIVE_DROP = ["CACHE-R", "IN", "TURNS", "AGENT", "MODEL", "OUT"]
 
+# Agent-tool subagents: TASK is the description you gave the tool, and it is the
+# only name they have, so it gets the flex column and a generous cap.
+SUBAGENT_SPEC = [("TASK", None, "<"), ("TYPE", 16, "<"), ("MODEL", 8, "<"),
+                 ("OUT", 7, ">"), ("IN", 7, ">"), ("TURNS", 6, ">"),
+                 ("IDLE", 6, ">"), ("STATE", 8, "<"), ("AGENT", 8, "<")]
+SUBAGENT_DROP = ["IN", "TURNS", "TYPE", "AGENT", "MODEL", "OUT"]
+
 
 def _usage_cells(name, u):
     """Cells shared by the token tables. The leading column is the flex one in
@@ -713,28 +821,56 @@ def _agent_meta(rundir, agent_id):
     return None, rid, None  # no summary (live run)
 
 
+def _last_assistant_text(path):
+    """An Agent-tool subagent's return value: its final assistant message.
+
+    There is no journal to read it from — for these agents the last thing they
+    said *is* what the parent received."""
+    out = ""
+    for d in _iter_json(path):
+        if d.get("type") != "assistant":
+            continue
+        txt = _msg_text((d.get("message") or {}).get("content"))
+        if txt.strip():
+            out = txt
+    return out or None
+
+
 def cmd_agent(args):
     pdirs = project_dirs(args)
     aid, path, rundir = find_agent(pdirs, args.agent)
-    meta, rid, wfname = _agent_meta(rundir, aid)
+    workflow = rundir.name.startswith("wf_")
     by_model, _ts, _lm = scan_agent_file(path)
     tot = blank()
     for u in by_model.values():
         for k, v in u.items():
             tot[k] += v
     task, tools, files, bash = agent_activity(path)
-    result = journal_result(rundir, aid)
 
     cols, _rows = term_size()
     print(fit(f"agent: {aid}", cols))
-    line = f"run:   {rid}"
-    if wfname:
-        line += f"  ({wfname})"
-    print(fit(line, cols))
-    if meta:
+    if workflow:
+        meta, rid, wfname = _agent_meta(rundir, aid)
+        result = journal_result(rundir, aid)
+        line = f"run:   {rid}"
+        if wfname:
+            line += f"  ({wfname})"
+        print(fit(line, cols))
+        if meta:
+            print("\n".join(wrap_fields(
+                [f"label: {meta.get('label')}", f"phase: {meta.get('phaseTitle')}",
+                 f"model: {meta.get('model')}", f"state: {meta.get('state')}"], cols)))
+    else:
+        # A plain Agent-tool subagent: its name and type come from the sibling
+        # .meta.json, and its state has to be read off its own transcript.
+        meta = subagent_meta(path)
+        result = _last_assistant_text(path)
+        print(fit(f"run:   — (session subagent of {rundir.parent.name})", cols))
         print("\n".join(wrap_fields(
-            [f"label: {meta.get('label')}", f"phase: {meta.get('phaseTitle')}",
-             f"model: {meta.get('model')}", f"state: {meta.get('state')}"], cols)))
+            [f"task:  {meta.get('description', '?')}",
+             f"type: {meta.get('agentType', '?')}",
+             f"model: {meta.get('model', '?')}",
+             f"state: {subagent_state(path)}"], cols)))
     print("\n".join(wrap_fields(
         [f"tokens: in {h(tot['in'])}  out {h(tot['out'])}",
          f"cache-r {h(tot['cache_read'])}  cache-w {h(tot['cache_create'])}",
@@ -840,7 +976,8 @@ def live_label_map(rundir):
     return lambda aid: labels.get(aid) or key_label.get(agent_key.get(aid))
 
 
-NO_LIVE = "no in-flight workflow runs. (all runs have completed summaries)"
+NO_LIVE = ("nothing in flight: no workflow runs and no subagents have written "
+           "in the last %d seconds." % LIVE_WINDOW)
 
 
 def live_runs(pdirs):
@@ -876,15 +1013,39 @@ def live_runs(pdirs):
     return out
 
 
-def render_live_run(run, cols, budget=None):
-    """Lines for one in-flight run, elided from the bottom to `budget` rows.
+def _elide(rows, lines, budget):
+    """Pick which agent rows fit in `budget`, returning (shown, hidden).
 
     `running` agents outrank finished ones for the available seats, however
     stale. An agent that started and then went quiet sorts to the bottom by
     recency — and that stalled agent is the most interesting row on the
     screen — so done/orphaned rows collapse into a count first. Only when the
     in-flight agents alone overrun the budget do they get cut too, freshest
-    kept, and the note says how many of each state went missing."""
+    kept. Display order is unchanged; rows are only removed from it."""
+    if budget is None or len(lines) + len(rows) <= budget:
+        return rows, []
+    room = max(budget - len(lines) - 1, 1)       # -1 for the elision note
+    inflight = [r for r in rows if r["state"] == "running"]
+    rest = [r for r in rows if r["state"] != "running"]
+    picked = {r["id"] for r in inflight[:room]}
+    picked |= {r["id"] for r in rest[:max(room - len(inflight), 0)]}
+    return ([r for r in rows if r["id"] in picked],
+            [r for r in rows if r["id"] not in picked])
+
+
+def _elision_note(hidden, cols):
+    """One line accounting for elided rows, by state. Never silently empty."""
+    if not hidden:
+        return []
+    by = defaultdict(int)
+    for r in hidden:
+        by[r["state"]] += 1
+    note = ", ".join(f"+{c} {s}" for s, c in sorted(by.items()))
+    return [fit(f"   … {note} hidden — `wfstat live` for all", cols)]
+
+
+def render_live_run(run, cols, budget=None):
+    """Lines for one in-flight workflow run, elided to `budget` rows."""
     states, rows = run["states"], run["rows"]
     idle = time.time() - run["newest"] if run["newest"] else None
     flag = "⚠ stalled?" if (idle and idle > 90) else "● active"
@@ -906,16 +1067,7 @@ def render_live_run(run, cols, budget=None):
     lines.append(render_row(LIVE_SPEC, keep, flex,
                             {k: k for k in keep}, indent="   ", cols=cols))
 
-    shown, hidden = rows, []
-    if budget is not None and len(lines) + len(rows) > budget:
-        room = max(budget - len(lines) - 1, 1)   # -1 for the elision note
-        inflight = [r for r in rows if r["state"] == "running"]
-        rest = [r for r in rows if r["state"] != "running"]
-        picked = {r["id"] for r in inflight[:room]}
-        picked |= {r["id"] for r in rest[:max(room - len(inflight), 0)]}
-        shown = [r for r in rows if r["id"] in picked]
-        hidden = [r for r in rows if r["id"] not in picked]
-
+    shown, hidden = _elide(rows, lines, budget)
     for r in shown:
         it = f"{int(time.time()-r['ts'])}s" if r["ts"] else "-"
         u = r["usage"]
@@ -924,23 +1076,58 @@ def render_live_run(run, cols, budget=None):
             "IN": h(u["in"]), "CACHE-R": h(u["cache_read"]),
             "TURNS": u["turns"], "IDLE": it, "STATE": r["state"],
             "AGENT": r["id"][:8]}, indent="   ", cols=cols))
-    if hidden:
-        by = defaultdict(int)
-        for r in hidden:
-            by[r["state"]] += 1
-        note = ", ".join(f"+{c} {s}" for s, c in sorted(by.items()))
-        lines.append(fit(f"   … {note} hidden — `wfstat live` for all", cols))
+    lines += _elision_note(hidden, cols)
     return lines
 
 
+def render_session_agents(sess, cols, budget=None):
+    """Lines for one session's in-flight Agent-tool subagents.
+
+    Same elision contract as a workflow run: newest first, running agents hold
+    their seats, whatever is dropped gets counted."""
+    rows = sess["rows"]
+    idle = time.time() - sess["newest"] if sess["newest"] else None
+    n_run = sum(1 for r in rows if r["state"] == "running")
+    lines = [fit(f"══ subagents  [{n_run} in flight]  {sess['session']}", cols)]
+    t = sess["total"]
+    fields = [f"agents: {len(rows)} active / {n_run} in-flight",
+              f"tokens: in {h(t['in'])}  out {h(t['out'])}  cache-r {h(t['cache_read'])}"]
+    if idle is not None:
+        fields.append(f"last write: {int(idle)}s ago")
+    lines += wrap_fields(fields, cols, indent="   ")
+
+    keep, flex = table_layout(cols, SUBAGENT_SPEC, 14, 34, SUBAGENT_DROP, indent=3)
+    lines.append(render_row(SUBAGENT_SPEC, keep, flex,
+                            {k: k for k in keep}, indent="   ", cols=cols))
+    shown, hidden = _elide(rows, lines, budget)
+    for r in shown:
+        u = r["usage"]
+        lines.append(render_row(SUBAGENT_SPEC, keep, flex, {
+            "TASK": r["label"], "TYPE": r["type"], "MODEL": str(r["model"]),
+            "OUT": h(u["out"]), "IN": h(u["in"]), "TURNS": u["turns"],
+            "IDLE": f"{int(time.time()-r['ts'])}s" if r["ts"] else "-",
+            "STATE": r["state"], "AGENT": r["id"][:8]}, indent="   ", cols=cols))
+    lines += _elision_note(hidden, cols)
+    return lines
+
+
+def live_blocks(pdirs):
+    """Everything in flight — workflow runs and plain session subagents — as
+    (renderer, data) pairs, most recently active first."""
+    blocks = [(render_live_run, r) for r in live_runs(pdirs)] + \
+             [(render_session_agents, s) for s in session_subagents(pdirs)]
+    blocks.sort(key=lambda b: -b[1]["newest"])
+    return blocks
+
+
 def cmd_live(args):
-    runs = live_runs(project_dirs(args))
+    blocks = live_blocks(project_dirs(args))
     cols, _rows = term_size()
-    if not runs:
+    if not blocks:
         print("\n".join(wrap_text(NO_LIVE, cols)))
         return
-    for run in runs:
-        print("\n".join(render_live_run(run, cols)))
+    for render, data in blocks:
+        print("\n".join(render(data, cols)))
         print()
 
 
@@ -982,11 +1169,11 @@ def live_frame(pdirs, cols, rows):
     the clamp eats is always accounted for in that footer — a frame that just
     stopped short would read as "this is everything"."""
     lines = [fit(f"wfstat live — {time.strftime('%H:%M:%S')}  (Ctrl-C to stop)", cols), ""]
-    runs = live_runs(pdirs)
+    runs = live_blocks(pdirs)
     if not runs:
         lines += wrap_text(NO_LIVE, cols)
         return "\n".join(lines[:rows])
-    need = [len(render_live_run(r, cols)) + 1 for r in runs]   # +1 trailing blank
+    need = [len(render(d, cols)) + 1 for render, d in runs]    # +1 trailing blank
     body = rows - len(lines)
     if sum(need) <= body:
         shown, lost_runs, alloc = len(runs), 0, need
@@ -997,8 +1184,8 @@ def live_frame(pdirs, cols, rows):
         shown = max(1, min(len(runs), (body - 1) // MIN_RUN_ROWS))
         lost_runs = len(runs) - shown
         alloc = _share_rows(need[:shown], max(body - (1 if lost_runs else 0), 0))
-    for run, a in zip(runs[:shown], alloc):
-        lines += render_live_run(run, cols, a - 1) + [""]
+    for (render, data), a in zip(runs[:shown], alloc):
+        lines += render(data, cols, a - 1) + [""]
     while lines and not lines[-1]:
         lines.pop()
     if lost_runs or len(lines) > rows:

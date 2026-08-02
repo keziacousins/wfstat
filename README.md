@@ -42,8 +42,8 @@ chmod +x ~/.local/bin/wfstat
 | --- | --- |
 | `wfstat ls` | All runs, newest first — in-flight ones reconstructed from transcripts and listed on top. Default command. |
 | `wfstat show <runId>` | Per-model and per-agent token breakdown for one run, plus cache hit rate. Prefixes work. |
-| `wfstat agent <id>` | One agent's task prompt, return value, token usage, tools used, files touched. Prefixes work. |
-| `wfstat live` | In-flight runs only: per-agent live token totals, idle time, and done/running/orphaned state. |
+| `wfstat agent <id>` | One agent's task prompt, return value, token usage, tools used, files touched. Works for workflow agents and session subagents alike. Prefixes work. |
+| `wfstat live` | Everything in flight — workflow runs **and** plain Agent-tool subagents — with live token totals, idle time and state. |
 | `wfstat watch` | `live` on a flicker-free 2s refresh loop until Ctrl-C, fitted to the window. `--interval` to change. |
 
 Global flags: `--project <abs path or encoded dir name>` to target a project other than the current
@@ -66,13 +66,14 @@ Everything comes from files the workflow engine writes under `~/.claude/projects
 <session>/workflows/wf_*.json                      per-run summary, written at completion
 <session>/subagents/workflows/wf_*/journal.jsonl   started/result events, appended live
 <session>/subagents/workflows/wf_*/agent-*.jsonl   per-agent transcript incl. message.usage, live
+<session>/subagents/agent-*.jsonl                  Agent-tool subagents of the session, live
 ```
 
 Token figures are summed from the `message.usage` blocks in the agent transcripts, so they are the
 real billed numbers rather than the summary's rounded total — and they are available *during* a run,
 before any summary exists.
 
-## Four things it gets right that the raw files don't
+## What it gets right that the raw files don't
 
 These are the reasons the tool exists; each is a trap the on-disk data sets for you.
 
@@ -82,9 +83,8 @@ error) and returned a halt object. `wfstat` derives an *effective* status from t
 trailing logs, and reports `⚠ halted` with the reason.
 
 **A resumed run looks finished.** A run relaunched with `resumeFromRunId` carries the stale summary
-from its earlier halt while actively appending new agents. Liveness is therefore decided by recent
-write activity, not by absence of a summary — a run is live if something was written in the last five
-minutes and no summary landed *after* that write.
+from its earlier halt while actively appending new agents, so the presence of a summary cannot settle
+whether a run is over — see the journal rule below for what does.
 
 **A frame taller than the window corrupts a live display.** `wfstat watch` repaints in place from
 the cursor home position, which only works while the frame fits: paint past the last row and the
@@ -93,6 +93,21 @@ runs on the alternate screen (leaving your scrollback untouched) and clamps each
 When agents don't all fit, in-flight ones keep their seats — a *stalled* agent sorts last by recency
 and is exactly what you need to see — and finished ones collapse into a count, so a short frame never
 reads as though it were the whole picture.
+
+**A summarised run is over, whatever the mtimes say.** Liveness cannot be settled by comparing the
+run summary against file activity: an agent still flushing its transcript as a run is killed writes
+*after* the summary lands, which reads as a resume. `wfstat` asks instead whether the **journal** has
+advanced since the summary — only the engine writes it, and only to record an agent starting or
+returning, so it moves when a resumed run picks up work and stays put when a run is over. The
+difference is not academic: a 101ms-late write once kept a killed run on screen as `⚠ stalled?` for
+five minutes, and a session watching it concluded the run was alive and waited on it indefinitely.
+
+**Not every agent is a workflow agent.** Agent-tool subagents live one level up, at
+`<session>/subagents/`, and have no journal at all — nothing on disk records their completion, and
+the session's `tool_result` is not it either (an async agent's result says only "launched
+successfully" and arrives immediately). `wfstat` reads their state off the shape of their own
+transcript: an agent that has returned ends on an `end_turn` assistant message with no pending tool
+call. Without them, "nothing in flight" was indistinguishable from "nothing I can see".
 
 **"Started with no result" does not mean "still running".** A stop-then-restart leaves the interrupted
 agent started-forever, while the engine re-issues that step as a *new* agent id sharing the same

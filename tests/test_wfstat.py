@@ -276,7 +276,7 @@ def big_live_run(fx, rid, n_done, n_running):
         aid = f"{i:08d}"
         jsonl(rd / f"agent-{aid}.jsonl", [
             {"type": "user", "message": {"content": "task"}},
-            assistant("claude-sonnet-5", iso(3 + i * 7),
+            assistant("claude-sonnet-5", iso(1 + i * 7),   # freshest run of the fixture
                       input_tokens=100 * i, output_tokens=10 * i)])
         journal.append({"type": "started", "agentId": aid, "key": f"k{i}"})
         if i < n_done:      # the freshest agents are the finished ones
@@ -415,7 +415,125 @@ class FrameTest(FixtureCase):
     def test_no_live_runs_renders_a_frame_not_an_exception(self):
         empty = Path(self.tmp.name) / "projects" / "-nonexistent"
         frame = wfstat.live_frame([empty], 80, 24)
-        self.assertIn("no in-flight", frame)
+        self.assertIn("nothing in flight", frame)
+
+
+def session_subagent(fx, aid, description, seconds_ago, finished, agent_type="general-purpose"):
+    """One Agent-tool subagent of the session — not a workflow agent.
+
+    These sit at <session>/subagents/ and carry a .meta.json instead of a
+    journal entry, so both their name and their state come from elsewhere."""
+    d = fx.session / "subagents"
+    d.mkdir(parents=True, exist_ok=True)
+    rows = [{"type": "user", "message": {"content": "do the thing"}},
+            assistant("claude-sonnet-5", iso(seconds_ago + 5),
+                      input_tokens=400, output_tokens=120)]
+    tail = {"type": "assistant", "timestamp": iso(seconds_ago), "message": {
+        "model": "claude-sonnet-5", "stop_reason": "end_turn" if finished else "tool_use",
+        "usage": {"input_tokens": 10, "output_tokens": 90},
+        "content": ([{"type": "text", "text": "Final answer: 42."}] if finished else
+                    [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}])}}
+    jsonl(d / f"agent-{aid}.jsonl", rows + [tail])
+    with open(d / f"agent-{aid}.meta.json", "w") as fh:
+        json.dump({"agentType": agent_type, "description": description,
+                   "toolUseId": f"toolu_{aid}", "spawnDepth": 1, "model": "sonnet"}, fh)
+
+
+class LivenessTest(FixtureCase):
+    """A run that has been summarised is over, whatever the mtimes say."""
+
+    def test_dying_agents_last_write_does_not_resurrect_a_killed_run(self):
+        # The real failure: a run was killed and summarised, but an agent was
+        # still flushing its transcript and landed 101ms *after* the summary.
+        # Comparing the summary to raw file activity read that as a resume and
+        # kept the corpse on screen, labelled "stalled?", for five minutes.
+        rd = self.fx.rundir("wf_killedrun003")
+        jsonl(rd / "journal.jsonl", [{"type": "started", "agentId": "eeee5555"}])
+        jsonl(rd / "agent-eeee5555.jsonl", [
+            assistant("claude-sonnet-5", iso(4), input_tokens=10, output_tokens=5)])
+        summ = self.fx.session / "workflows" / "wf_killedrun003.json"
+        with open(summ, "w") as fh:
+            json.dump({"runId": "wf_killedrun003", "workflowName": "doomed",
+                       "status": "killed", "error": "Error: Workflow aborted"}, fh)
+        journal_t = os.path.getmtime(rd / "journal.jsonl")
+        os.utime(summ, (journal_t + 60, journal_t + 60))                 # summary after
+        os.utime(rd / "agent-eeee5555.jsonl",
+                 (journal_t + 60.101, journal_t + 60.101))               # death rattle
+        try:
+            live = {rid for rid, _rd, _p in wfstat.live_run_dirs(
+                [Path(self.tmp.name) / "projects" / ENCODED])}
+            self.assertNotIn("wf_killedrun003", live)
+        finally:
+            for f in list(rd.iterdir()):
+                f.unlink()
+            rd.rmdir()
+            summ.unlink()
+
+    def test_a_resumed_run_whose_journal_advanced_is_still_live(self):
+        # The case the rule must not break: a stale summary from an earlier
+        # halt, but the journal has since recorded new work.
+        rd = self.fx.rundir("wf_resumedrun04")
+        jsonl(rd / "agent-ffff6666.jsonl", [
+            assistant("claude-sonnet-5", iso(3), input_tokens=10, output_tokens=5)])
+        summ = self.fx.session / "workflows" / "wf_resumedrun04.json"
+        with open(summ, "w") as fh:
+            json.dump({"runId": "wf_resumedrun04", "workflowName": "resumed",
+                       "status": "halted"}, fh)
+        base = os.path.getmtime(summ)
+        jsonl(rd / "journal.jsonl", [{"type": "started", "agentId": "ffff6666"}])
+        os.utime(rd / "journal.jsonl", (base + 30, base + 30))   # new work after summary
+        try:
+            live = {rid for rid, _rd, _p in wfstat.live_run_dirs(
+                [Path(self.tmp.name) / "projects" / ENCODED])}
+            self.assertIn("wf_resumedrun04", live)
+        finally:
+            for f in list(rd.iterdir()):
+                f.unlink()
+            rd.rmdir()
+            summ.unlink()
+
+
+class SubagentTest(FixtureCase):
+    """Agent-tool subagents: the ones that are not part of any workflow."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        session_subagent(cls.fx, "1111aaaa", "audit the verb catalog", 3, finished=False)
+        session_subagent(cls.fx, "2222bbbb", "critique the design", 8, finished=True)
+        session_subagent(cls.fx, "3333cccc", "ancient history", 9999, finished=True)
+
+    def test_live_reports_session_subagents(self):
+        out = self.run_cli("live")
+        self.assertIn("audit the verb catalog", out)
+        self.assertIn("critique the design", out)
+        self.assertIn("subagents", out)
+
+    def test_state_comes_from_the_transcript_tail_not_the_mtime(self):
+        d = self.fx.session / "subagents"
+        self.assertEqual(wfstat.subagent_state(d / "agent-1111aaaa.jsonl"), "running")
+        self.assertEqual(wfstat.subagent_state(d / "agent-2222bbbb.jsonl"), "done")
+
+    def test_stale_subagents_are_not_reported_live(self):
+        out = self.run_cli("live")
+        self.assertNotIn("ancient history", out)
+
+    def test_agent_command_works_on_a_session_subagent(self):
+        out = self.run_cli("agent", "2222bbbb")
+        self.assertIn("critique the design", out)
+        self.assertIn("general-purpose", out)
+        self.assertIn("session subagent", out)
+        self.assertIn("Final answer: 42.", out)   # its return value is its last message
+
+    def test_workflow_agents_still_resolve_unambiguously(self):
+        out = self.run_cli("agent", "aaaa1111")
+        self.assertIn("review:bugs", out)
+        self.assertNotIn("session subagent", out)
+
+    def test_blocks_are_ordered_most_recently_active_first(self):
+        blocks = wfstat.live_blocks([Path(self.tmp.name) / "projects" / ENCODED])
+        stamps = [d["newest"] for _r, d in blocks]
+        self.assertEqual(stamps, sorted(stamps, reverse=True))
 
 
 class UnitTest(unittest.TestCase):

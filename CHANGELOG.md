@@ -10,6 +10,37 @@ change under us; when it does, the fix ships as a patch release.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-08-02
+
+### Added
+
+- `live` and `watch` now report **Agent-tool subagents**, not just workflow
+  agents. They live at `<session>/subagents/` and were previously invisible: a
+  session could be running a dozen of them while `wfstat` reported nothing,
+  making "nothing in flight" impossible to tell from "nothing I can see".
+- `agent <id>` resolves those subagents too, showing the description you gave
+  the Agent tool, its type and model, and its return value — which for these is
+  its final assistant message, since no journal records one.
+- In-flight blocks are ordered most-recently-active first, runs and subagents
+  interleaved.
+
+### Fixed
+
+- A killed run could keep showing as live, labelled `⚠ stalled?`, for the full
+  five-minute window. Liveness compared the run summary against raw file
+  activity, and an agent still flushing its transcript as the run was killed
+  wrote **101ms after** the summary landed — which read as a resume. Liveness
+  now asks whether the **journal** has advanced since the summary: only the
+  engine writes it, and only to record an agent starting or returning, so it
+  moves when a resumed run picks up real work and stays put when a run is over.
+  This misreport was load-bearing — a control session watching a dead run
+  concluded it was alive and waited on it indefinitely.
+
+### Changed
+
+- The empty-state message now names both things it looked for and the window it
+  looked in, rather than claiming "all runs have completed summaries".
+
 ## [1.1.0] — 2026-08-02
 
 ### Added
@@ -60,6 +91,7 @@ First tagged release; `wfstat` extracted into a standalone repository.
   resume-cache `key`, which also recovers labels for live agents.
 - CI on Linux and macOS across Python 3.9, 3.11 and 3.13.
 
-[Unreleased]: https://github.com/keziacousins/wfstat/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/keziacousins/wfstat/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/keziacousins/wfstat/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/keziacousins/wfstat/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/keziacousins/wfstat/releases/tag/v1.0.0
