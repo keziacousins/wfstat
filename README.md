@@ -47,12 +47,35 @@ chmod +x ~/.local/bin/wfstat
 | `wfstat watch` | `live` on a flicker-free 2s refresh loop until Ctrl-C, fitted to the window. `--interval` to change. |
 
 Global flags: `--project <abs path or encoded dir name>` to target a project other than the current
-directory, `--all` to scan every project. `wfstat agent --full` prints untruncated task/result text.
+directory, `--all` to scan every project, `--json` for machine-readable output (see below).
+`wfstat agent --full` prints untruncated task/result text.
 
 Every command fits its output to the terminal. Tables shed their least actionable columns as the
 window narrows (`CACHE-R` goes before `STATE`); status lines wrap onto continuation lines instead,
 since the numbers on them are the point. Redirected output is never clamped, so `wfstat live | less`
 keeps every column — set `COLUMNS` to pin a width explicitly.
+
+### Machine-readable output
+
+`ls`, `show`, `agent` and `live` take `--json` and print a single JSON object instead of a table.
+It is the interface to use from scripts and from other agents: nothing is dropped or clipped to fit
+a window, and `agent --json` gives the full task and return value, with a structured result left as
+JSON rather than flattened to text.
+
+```sh
+wfstat live --json | jq '.runs[] | select(.status == "stalled") | .run_id'
+wfstat agent a1b2 --json | jq .result
+```
+
+Every document carries `"schema": 1`, which is bumped on any breaking change to the shape, so a
+consumer can refuse a layout it doesn't recognise instead of misreading it. Within a schema,
+fields may be added but are never removed or renamed. Timestamps are ISO 8601 in UTC
+(`last_activity_at`, `started_at`), durations and ages are numbers (`duration_ms`, `idle_s`), and
+a field a record can't know is `null` rather than missing: a live run has no `duration_ms`, and a
+finished run has no per-state `agent_states`. Token usage is always an object with `input`,
+`output`, `cache_read`, `cache_create` and `turns`.
+
+`watch` is a display and refuses `--json`; poll `wfstat live --json` instead.
 
 By default the project is auto-detected by walking up from `$PWD` to the nearest ancestor that has a
 Claude project directory, so it works from any subdirectory.

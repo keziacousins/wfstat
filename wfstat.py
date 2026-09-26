@@ -21,10 +21,14 @@ Output is fitted to the terminal: tables shed their least actionable columns as
 the window narrows, status lines wrap rather than lose fields, and `watch` clamps
 each frame to the window (a frame that scrolls corrupts the in-place repaint).
 Redirected output is left unclamped; set $COLUMNS to pin a width.
+
+--json on ls/show/agent/live prints one JSON object (versioned by its "schema"
+key) instead of a table — the interface for scripts and other agents.
 """
 import json, os, re, sys, glob, time, argparse, shutil
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timezone
 
 __version__ = "1.2.1"
 
@@ -62,12 +66,12 @@ def project_dirs(args):
 
 # ---- token accounting -----------------------------------------------------
 def blank():
-    return {"in": 0, "out": 0, "cache_read": 0, "cache_create": 0, "turns": 0}
+    return {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0, "turns": 0}
 
 
 def add_usage(acc, u):
-    acc["in"] += u.get("input_tokens", 0)
-    acc["out"] += u.get("output_tokens", 0)
+    acc["input"] += u.get("input_tokens", 0)
+    acc["output"] += u.get("output_tokens", 0)
     acc["cache_read"] += u.get("cache_read_input_tokens", 0)
     acc["cache_create"] += u.get("cache_creation_input_tokens", 0)
     acc["turns"] += 1
@@ -104,7 +108,8 @@ def _msg_text(content):
 
 
 def agent_activity(path):
-    """Parse one agent transcript: task prompt, tool counts, files touched, bash."""
+    """Parse one agent transcript: task prompt, tool counts, files touched
+    (full paths, as the agent gave them), and the first line of each bash."""
     task = None
     tools = defaultdict(int)
     files = defaultdict(int)
@@ -124,7 +129,7 @@ def agent_activity(path):
             inp = b.get("input") or {}
             fp = inp.get("file_path")
             if n in ("Edit", "Write", "MultiEdit", "NotebookEdit") and fp:
-                files[_short_path(fp)] += 1
+                files[fp] += 1
             if n == "Bash" and inp.get("command"):
                 bash.append(inp["command"].strip().splitlines()[0][:100])
     return task or "", dict(tools), dict(files), bash
@@ -212,7 +217,6 @@ def find_agent(pdirs, prefix):
 def _epoch(ts):
     # ISO8601 like 2026-07-14T13:07:30.958Z
     try:
-        from datetime import datetime, timezone
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except Exception:
         return 0.0
@@ -222,6 +226,30 @@ def merge(dst, src):
     for m, u in src.items():
         for k, v in u.items():
             dst[m][k] += v
+
+
+def total_usage(by_model, into=None):
+    """Collapse a model->usage dict into one usage dict (added to `into` too)."""
+    tot = blank()
+    for u in by_model.values():
+        for k, v in u.items():
+            tot[k] += v
+            if into is not None:
+                into[k] += v
+    return tot
+
+
+def _iso(epoch):
+    """Epoch seconds -> ISO 8601 UTC with a Z, or None for 'no timestamp'."""
+    if not epoch:
+        return None
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _idle(epoch):
+    """Seconds since `epoch`, whole, or None when there is no timestamp."""
+    return int(time.time() - epoch) if epoch else None
 
 
 # ---- discovery ------------------------------------------------------------
@@ -268,6 +296,7 @@ def effective_status(d):
 
 
 LIVE_WINDOW = 300  # seconds of write silence before a run is no longer "live"
+STALL_AFTER = 90   # seconds of silence before a live run is flagged stalled?
 
 
 def _newest_activity(rundir):
@@ -390,14 +419,10 @@ def session_subagents(pdirs):
                 if now - ts > LIVE_WINDOW:
                     continue
                 newest = max(newest, ts)
-                tot = blank()
-                for u in bm.values():
-                    for k, v in u.items():
-                        tot[k] += v
-                        total[k] += v
+                tot = total_usage(bm, into=total)
                 meta = subagent_meta(af)
                 rows.append({"id": Path(af).stem.replace("agent-", ""),
-                             "label": meta.get("description") or "(no description)",
+                             "label": meta.get("description"),
                              "type": meta.get("agentType", "?"),
                              "model": meta.get("model") or last_model or "?",
                              "usage": tot, "ts": ts, "state": subagent_state(af)})
@@ -454,11 +479,7 @@ def live_run_stats(rundir):
     for af in sorted(glob.glob(str(rundir / "agent-*.jsonl"))):
         bm, last_ts, last_model = scan_agent_file(af)
         newest = max(newest, last_ts)
-        tot = blank()
-        for u in bm.values():
-            for k, v in u.items():
-                tot[k] += v
-                run_total[k] += v
+        tot = total_usage(bm, into=run_total)
         aid = Path(af).stem.replace("agent-", "")
         rows.append((aid, last_model, tot, last_ts, aid in result))
     models = sorted({m for _a, m, _u, _t, _d in rows if m})
@@ -467,6 +488,15 @@ def live_run_stats(rundir):
 
 
 # ---- formatting -----------------------------------------------------------
+JSON_SCHEMA = 1   # bump on any breaking change to --json output
+
+
+def emit_json(obj):
+    """Print one --json document. Never width-clamped: it's data, not display.
+
+    `schema` versions the shape independently of wfstat's own version, so a
+    consumer can refuse a layout it doesn't know rather than misread it."""
+    print(json.dumps({"schema": JSON_SCHEMA, **obj}, indent=2, ensure_ascii=False))
 def h(n):
     if n is None:
         return "-"
@@ -667,20 +697,94 @@ def _usage_cells(name, u):
     each — MODEL in `show`'s per-model table, LABEL in the per-agent ones — so
     the name is filled under both keys and callers overwrite MODEL as needed."""
     return {"MODEL": name, "LABEL": name,
-            "IN": h(u["in"]), "OUT": h(u["out"]),
+            "IN": h(u["input"]), "OUT": h(u["output"]),
             "CACHE-R": h(u["cache_read"]), "CACHE-W": h(u["cache_create"]),
             "TURNS": u["turns"]}
 
 
-def cmd_ls(args):
-    pdirs = project_dirs(args)
-    rows = summaries(pdirs)
+def _state_counts(states):
+    return {st: sum(1 for v in states.values() if v == st)
+            for st in ("done", "running", "orphaned")}
+
+
+def ls_data(pdirs):
+    """Every run, in-flight first then newest first, as plain dicts.
+
+    One record shape for both kinds so a consumer can treat the list
+    uniformly; fields a kind can't know (a live run's duration, a finished
+    run's per-state agent counts) are None rather than absent."""
+    summ = summaries(pdirs)
     live = [(rid, rd, p) for rid, rd, p in live_run_dirs(pdirs)
             if glob.glob(str(rd / "agent-*.jsonl"))]
     live_ids = {rid for rid, _rd, _p in live}
-    prior = {rid for rid, _f, _d, _p in rows}  # runs with an (old) summary
-    rows = [r for r in rows if r[0] not in live_ids]  # don't double-list resumed runs
-    if not rows and not live:
+    prior = {rid for rid, _f, _d, _p in summ}  # runs with an (old) summary
+    runs = []
+    # in-flight first — reconstructed from transcripts (no summary yet)
+    for rid, rd, p in live:
+        s = live_run_stats(rd)
+        idle = _idle(s["newest"])
+        if idle is not None and idle > STALL_AFTER:
+            status = "stalled"
+        else:
+            status = "resumed" if rid in prior else "running"
+        runs.append({
+            "run_id": rid, "name": live_run_name(p, rid), "live": True,
+            "status": status, "raw_status": None, "reason": None,
+            "started_at": None, "last_activity_at": _iso(s["newest"]),
+            "idle_s": idle, "duration_ms": None,
+            "agent_count": len(s["states"]),
+            "agent_states": _state_counts(s["states"]),
+            # non-cache, so comparable to a summary's totalTokens
+            "total_tokens": s["total"]["input"] + s["total"]["output"],
+            "models": s["models"], "session": p.name})
+    for rid, _f, d, p in summ:
+        if rid in live_ids:      # don't double-list resumed runs
+            continue
+        eff, reason = effective_status(d)
+        st = d.get("startTime")
+        runs.append({
+            "run_id": rid, "name": d.get("workflowName"), "live": False,
+            "status": eff, "raw_status": d.get("status"), "reason": reason,
+            "started_at": _iso(st / 1000) if st else None,
+            "last_activity_at": None, "idle_s": None,
+            "duration_ms": d.get("durationMs"),
+            "agent_count": d.get("agentCount"), "agent_states": None,
+            "total_tokens": d.get("totalTokens"),
+            "models": [d["defaultModel"]] if d.get("defaultModel") else [],
+            "session": p.name})
+    return runs
+
+
+_LS_LABEL = {"halted": "⚠ halted", "killed": "✗ killed", "failed": "✗ failed",
+             "running": "▶ running", "resumed": "▶ resumed",
+             "stalled": "▶ stalled?"}
+
+
+def _ls_cells(r):
+    if r["live"]:
+        # Orphaned agents stay out of the denominator: a restart re-issued
+        # their step under a new id, which is already counted, so counting the
+        # corpse too reads as work still owed.
+        c = r["agent_states"]
+        agents = f"{c['done']}/{c['done'] + c['running']}"
+        when, duration = r["last_activity_at"], "—"
+        models = r["models"]
+        model = models[0] if len(models) == 1 else ("mixed" if models else "-")
+    else:
+        agents = "-" if r["agent_count"] is None else str(r["agent_count"])
+        when, duration = r["started_at"], dur(r["duration_ms"])
+        model = r["models"][0] if r["models"] else "-"
+    return {"RUN": r["run_id"], "NAME": r["name"] or "?",
+            "STATUS": _LS_LABEL.get(r["status"], r["status"]),
+            "WHEN": ago(_epoch(when) * 1000) if when else "-", "DUR": duration,
+            "AGENTS": agents, "TOKENS": h(r["total_tokens"]), "MODEL": model}
+
+
+def cmd_ls(args):
+    runs = ls_data(project_dirs(args))
+    if args.json:
+        return emit_json({"runs": runs})
+    if not runs:
         print("no workflow runs found.")
         return
     cols, _rows = term_size()
@@ -689,50 +793,15 @@ def cmd_ls(args):
     keep, flex = table_layout(cols, LS_SPEC, 16, 24, LS_DROP)
     print(render_row(LS_SPEC, keep, flex, {k: k for k in keep}, cols=cols))
     print(rule(row_width(LS_SPEC, keep, flex), cols))
-
-    # in-flight first — reconstructed from transcripts (no summary yet)
-    for rid, rd, p in live:
-        s = live_run_stats(rd)
-        idle = time.time() - s["newest"] if s["newest"] else None
-        resumed = rid in prior
-        if idle is not None and idle > 90:
-            status = "▶ stalled?"
-        else:
-            status = "▶ resumed" if resumed else "▶ running"
-        tok = s["total"]["in"] + s["total"]["out"]  # non-cache, comparable to summary
-        model = s["models"][0] if len(s["models"]) == 1 else (
-            "mixed" if s["models"] else "-")
-        print(render_row(LS_SPEC, keep, flex, {
-            "RUN": rid, "NAME": live_run_name(p, rid), "STATUS": status,
-            "WHEN": ago(s["newest"] * 1000) if s["newest"] else "-", "DUR": "—",
-            "AGENTS": _agents_cell(s["states"]),
-            "TOKENS": h(tok), "MODEL": model}, cols=cols))
-
-    for rid, _f, d, _p in rows:
-        eff, _reason = effective_status(d)
-        label = {"halted": "⚠ halted", "killed": "✗ killed",
-                 "failed": "✗ failed"}.get(eff, eff)
-        print(render_row(LS_SPEC, keep, flex, {
-            "RUN": rid, "NAME": d.get("workflowName", "?"), "STATUS": label,
-            "WHEN": ago(d.get("startTime")), "DUR": dur(d.get("durationMs")),
-            "AGENTS": str(d.get("agentCount", "-")),
-            "TOKENS": h(d.get("totalTokens")),
-            "MODEL": d.get("defaultModel", "-")}, cols=cols))
-    n = len(rows) + len(live)
-    extra = f"  ({len(live)} running)" if live else ""
+    for r in runs:
+        print(render_row(LS_SPEC, keep, flex, _ls_cells(r), cols=cols))
+    n_live = sum(1 for r in runs if r["live"])
+    extra = f"  ({n_live} running)" if n_live else ""
     print()
     print("\n".join(wrap_fields(
-        [f"{n} run(s){extra}.",
+        [f"{len(runs)} run(s){extra}.",
          "`wfstat show <run>` for tokens · `wfstat live` for live agents."],
         cols, sep=" ")))
-
-
-def _agents_cell(states):
-    """`done/outstanding` for a live run in `ls`. Orphaned agents are left out
-    of the denominator: a restart re-issued their step under a new id, which is
-    already counted, so counting the corpse too reads as work still owed."""
-    done = sum(1 for s in states.values() if s == "done")
-    return f"{done}/{done + sum(1 for s in states.values() if s == 'running')}"
 
 
 def _resolve(pdirs, prefix):
@@ -749,9 +818,9 @@ def _resolve(pdirs, prefix):
     return ("done", rid, (f, d), p)
 
 
-def cmd_show(args):
-    pdirs = project_dirs(args)
-    kind, rid, payload, p = _resolve(pdirs, args.run)
+def show_data(pdirs, prefix, with_agents=True):
+    """One run's real token usage, per model and per agent, as a dict."""
+    kind, rid, payload, p = _resolve(pdirs, prefix)
     # aggregate real usage from the agent transcripts
     rundir = p / "subagents" / "workflows" / rid
     by_model = defaultdict(blank)
@@ -759,76 +828,108 @@ def cmd_show(args):
     for af in sorted(glob.glob(str(rundir / "agent-*.jsonl"))):
         bm, last_ts, last_model = scan_agent_file(af)
         merge(by_model, bm)
-        tot = blank()
-        for u in bm.values():
-            for k, v in u.items():
-                tot[k] += v
-        per_agent.append((Path(af).stem.replace("agent-", ""), last_model, tot, last_ts))
+        per_agent.append((Path(af).stem.replace("agent-", ""), last_model,
+                          total_usage(bm), last_ts))
+    grand = total_usage(by_model)
+    wire = grand["input"] + grand["cache_read"] + grand["cache_create"]
+    billed = wire + grand["output"]
 
-    # id → label from the run summary's workflowProgress (empty for live runs)
+    out = {"run_id": rid, "live": kind == "live", "name": None,
+           "status": "live" if kind == "live" else None, "raw_status": None,
+           "reason": None, "duration_ms": None, "agent_count": None,
+           "summary_total_tokens": None, "tool_calls": None,
+           "default_model": None, "session": p.name}
     labels = {}
-    if kind == "done":
-        for e in payload[1].get("workflowProgress", []):
-            if e.get("agentId") and e.get("label"):
-                labels[e["agentId"]] = e["label"]
-
-    cols, _rows = term_size()
-    print(fit(f"run:   {rid}", cols))
     if kind == "done":
         d = payload[1]
         eff, reason = effective_status(d)
-        shown = eff if eff == d.get("status") else f"{eff} (raw: {d.get('status')})"
+        out.update({"name": d.get("workflowName"), "status": eff,
+                    "raw_status": d.get("status"), "reason": reason,
+                    "duration_ms": d.get("durationMs"),
+                    "agent_count": d.get("agentCount"),
+                    "summary_total_tokens": d.get("totalTokens"),
+                    "tool_calls": d.get("totalToolCalls"),
+                    "default_model": d.get("defaultModel")})
+        # id → label from the run summary's workflowProgress
+        for e in d.get("workflowProgress", []):
+            if e.get("agentId") and e.get("label"):
+                labels[e["agentId"]] = e["label"]
+    else:
+        out["name"] = live_run_name(p, rid)
+        label_of = live_label_map(rundir)
+        labels = {aid: label_of(aid) for aid, *_r in per_agent}
+    out["usage"] = {"by_model": {m: by_model[m] for m in sorted(by_model)},
+                    "total": grand, "wire_input": wire,
+                    "cache_hit_pct": round(100 * grand["cache_read"] / billed, 1)
+                    if billed else 0.0}
+    if with_agents:
+        # ranked by output, as the table shows them; resume-cached agents
+        # (no API calls this run) are kept, flagged, at the end
+        out["agents"] = [
+            {"agent_id": aid, "label": labels.get(aid), "model": model,
+             "usage": u, "last_activity_at": _iso(ts), "cached": not u["turns"]}
+            for aid, model, u, ts in sorted(per_agent, key=lambda x: (
+                not x[2]["turns"], -x[2]["output"]))]
+    return out
+
+
+def cmd_show(args):
+    d = show_data(project_dirs(args), args.run, with_agents=not args.no_agents)
+    if args.json:
+        return emit_json(d)
+    cols, _rows = term_size()
+    print(fit(f"run:   {d['run_id']}", cols))
+    if not d["live"]:
+        eff = d["status"]
+        shown = eff if eff == d["raw_status"] else f"{eff} (raw: {d['raw_status']})"
         print("\n".join(wrap_fields(
-            [f"name:  {d.get('workflowName')}", f"status: {shown}",
-             f"duration: {dur(d.get('durationMs'))}",
-             f"agents: {d.get('agentCount')}"], cols)))
+            [f"name:  {d['name']}", f"status: {shown}",
+             f"duration: {dur(d['duration_ms'])}",
+             f"agents: {d['agent_count']}"], cols)))
         print("\n".join(wrap_fields(
-            [f"summary totalTokens: {h(d.get('totalTokens'))}",
-             f"toolCalls: {d.get('totalToolCalls')}",
-             f"defaultModel: {d.get('defaultModel')}"], cols)))
-        if eff in ("halted", "killed", "failed") and reason:
+            [f"summary totalTokens: {h(d['summary_total_tokens'])}",
+             f"toolCalls: {d['tool_calls']}",
+             f"defaultModel: {d['default_model']}"], cols)))
+        if eff in ("halted", "killed", "failed") and d["reason"]:
             print()
-            print("\n".join(wrap_text(f"⚠ {eff.upper()}: {reason}", cols, "  ")))
+            print("\n".join(wrap_text(f"⚠ {eff.upper()}: {d['reason']}", cols, "  ")))
     else:
         print("\n".join(wrap_text(
             "status: LIVE (no summary yet — reconstructed from transcripts)", cols)))
     print()
 
-    if not by_model:
+    usage = d["usage"]
+    if not usage["by_model"]:
         print("  (no real token usage recorded yet)")
         return
 
     keep, flex = table_layout(cols, SHOW_SPEC, 14, 26, SHOW_DROP)
     print(render_row(SHOW_SPEC, keep, flex, {k: k for k in keep}, cols=cols))
     print(rule(row_width(SHOW_SPEC, keep, flex), cols))
-    grand = blank()
-    for m in sorted(by_model):
-        u = by_model[m]
-        for k, v in u.items():
-            grand[k] += v
+    for m, u in usage["by_model"].items():
         print(render_row(SHOW_SPEC, keep, flex, _usage_cells(m, u), cols=cols))
     print(rule(row_width(SHOW_SPEC, keep, flex), cols))
-    print(render_row(SHOW_SPEC, keep, flex, _usage_cells("TOTAL", grand), cols=cols))
-    billed = grand['in'] + grand['out'] + grand['cache_read'] + grand['cache_create']
-    cache_pct = 100 * grand['cache_read'] / billed if billed else 0
+    print(render_row(SHOW_SPEC, keep, flex, _usage_cells("TOTAL", usage["total"]),
+                     cols=cols))
     print()
     print("\n".join(wrap_fields(
-        [f"wire input ≈ {h(grand['in']+grand['cache_read']+grand['cache_create'])}",
-         f"{cache_pct:.0f}% of input served from cache"],
+        [f"wire input ≈ {h(usage['wire_input'])}",
+         f"{usage['cache_hit_pct']:.0f}% of input served from cache"],
         cols, indent="  ", sep="  |  ")))
 
-    if not args.no_agents:
-        active = [a for a in per_agent if a[2]['turns']]
-        cached = len(per_agent) - len(active)
+    if "agents" in d:
+        active = [a for a in d["agents"] if not a["cached"]]
+        cached = len(d["agents"]) - len(active)
         print()
         print("\n".join(wrap_text(
             f"per-agent ({len(active)} with API calls, ranked by output):", cols)))
         keep, flex = table_layout(cols, AGENTS_SPEC, 12, 26, AGENTS_DROP)
         print(render_row(AGENTS_SPEC, keep, flex, {k: k for k in keep}, cols=cols))
         print(rule(row_width(AGENTS_SPEC, keep, flex), cols))
-        for aid, model, u, _ts in sorted(active, key=lambda x: -x[2]['out']):
-            cells = _usage_cells(labels.get(aid, f"({aid[:8]})"), u)
-            cells.update({"MODEL": str(model), "AGENT": aid[:8]})
+        for a in active:
+            aid = a["agent_id"]
+            cells = _usage_cells(a["label"] or f"({aid[:8]})", a["usage"])
+            cells.update({"MODEL": str(a["model"]), "AGENT": aid[:8]})
             print(render_row(AGENTS_SPEC, keep, flex, cells, cols=cols))
         if cached:
             print(fit(f"  (+{cached} resume-cached agent(s): returned from cache, "
@@ -863,54 +964,74 @@ def _last_assistant_text(path):
     return out or None
 
 
-def cmd_agent(args):
-    pdirs = project_dirs(args)
-    aid, path, rundir = find_agent(pdirs, args.agent)
-    workflow = rundir.name.startswith("wf_")
-    by_model, _ts, _lm = scan_agent_file(path)
-    tot = blank()
-    for u in by_model.values():
-        for k, v in u.items():
-            tot[k] += v
-    task, tools, files, bash = agent_activity(path)
+def agent_data(pdirs, prefix):
+    """Everything known about one agent, untruncated, as a dict.
 
-    cols, _rows = term_size()
-    print(fit(f"agent: {aid}", cols))
-    if workflow:
+    Workflow agents and plain Agent-tool subagents share one shape; `kind`
+    tells them apart, and fields one kind never has are None."""
+    aid, path, rundir = find_agent(pdirs, prefix)
+    by_model, last_ts, _lm = scan_agent_file(path)
+    task, tools, files, bash = agent_activity(path)
+    out = {"agent_id": aid, "kind": None, "run_id": None, "workflow_name": None,
+           "session": None, "label": None, "phase": None, "type": None,
+           "model": None, "state": None, "usage": total_usage(by_model),
+           "last_activity_at": _iso(last_ts), "task": task or None,
+           "result": None, "tools": tools, "files": files, "bash": bash}
+    if rundir.name.startswith("wf_"):
         meta, rid, wfname = _agent_meta(rundir, aid)
-        result = journal_result(rundir, aid)
-        line = f"run:   {rid}"
-        if wfname:
-            line += f"  ({wfname})"
-        print(fit(line, cols))
-        if meta:
-            print("\n".join(wrap_fields(
-                [f"label: {meta.get('label')}", f"phase: {meta.get('phaseTitle')}",
-                 f"model: {meta.get('model')}", f"state: {meta.get('state')}"], cols)))
+        meta = meta or {}
+        out.update({"kind": "workflow", "run_id": rid, "workflow_name": wfname,
+                    "session": rundir.parents[2].name,
+                    "label": meta.get("label"), "phase": meta.get("phaseTitle"),
+                    "model": meta.get("model"), "state": meta.get("state"),
+                    "result": journal_result(rundir, aid)})
     else:
         # A plain Agent-tool subagent: its name and type come from the sibling
         # .meta.json, and its state has to be read off its own transcript.
         meta = subagent_meta(path)
-        result = _last_assistant_text(path)
-        print(fit(f"run:   — (session subagent of {rundir.parent.name})", cols))
+        out.update({"kind": "subagent", "session": rundir.parent.name,
+                    "label": meta.get("description"), "type": meta.get("agentType"),
+                    "model": meta.get("model"), "state": subagent_state(path),
+                    "result": _last_assistant_text(path)})
+    return out
+
+
+def cmd_agent(args):
+    d = agent_data(project_dirs(args), args.agent)
+    if args.json:
+        return emit_json(d)
+    tot = d["usage"]
+    cols, _rows = term_size()
+    print(fit(f"agent: {d['agent_id']}", cols))
+    if d["kind"] == "workflow":
+        line = f"run:   {d['run_id']}"
+        if d["workflow_name"]:
+            line += f"  ({d['workflow_name']})"
+        print(fit(line, cols))
+        if d["label"] or d["phase"] or d["state"]:
+            print("\n".join(wrap_fields(
+                [f"label: {d['label']}", f"phase: {d['phase']}",
+                 f"model: {d['model']}", f"state: {d['state']}"], cols)))
+    else:
+        print(fit(f"run:   — (session subagent of {d['session']})", cols))
         print("\n".join(wrap_fields(
-            [f"task:  {meta.get('description', '?')}",
-             f"type: {meta.get('agentType', '?')}",
-             f"model: {meta.get('model', '?')}",
-             f"state: {subagent_state(path)}"], cols)))
+            [f"task:  {d['label'] or '?'}", f"type: {d['type'] or '?'}",
+             f"model: {d['model'] or '?'}", f"state: {d['state']}"], cols)))
     print("\n".join(wrap_fields(
-        [f"tokens: in {h(tot['in'])}  out {h(tot['out'])}",
+        [f"tokens: in {h(tot['input'])}  out {h(tot['output'])}",
          f"cache-r {h(tot['cache_read'])}  cache-w {h(tot['cache_create'])}",
          f"turns {tot['turns']}"], cols)))
 
-    if task:
+    if d["task"]:
         print("\n── task ──")
-        print(_squeeze(task, args.full, 1200))
+        print(_squeeze(d["task"], args.full, 1200))
+    result = d["result"]
     if result is not None:
         print("\n── result ──")
         rtxt = result if isinstance(result, str) else json.dumps(result, indent=2)
         print(_squeeze(rtxt, args.full, 1600))
 
+    tools, files = d["tools"], d["files"]
     if tools:
         order = sorted(tools.items(), key=lambda x: -x[1])
         print("\n── activity ──")
@@ -919,11 +1040,14 @@ def cmd_agent(args):
                                     cols, indent="  ", sep="  ")))
     if files:
         print("  files touched:")
-        for f, c in sorted(files.items(), key=lambda x: -x[1]):
+        short = defaultdict(int)     # the data keeps full paths; display doesn't
+        for f, c in files.items():
+            short[_short_path(f)] += c
+        for f, c in sorted(short.items(), key=lambda x: -x[1]):
             print(fit(f"    {c:>3}  {f}", cols))
-    if bash and args.full:
+    if d["bash"] and args.full:
         print("  bash (first line of each):")
-        for c in bash:
+        for c in d["bash"]:
             print(fit(f"    $ {c}", cols))
 
 
@@ -1007,18 +1131,16 @@ def live_runs(pdirs):
         for af in sorted(agent_files):
             bm, last_ts, last_model = scan_agent_file(af)
             newest = max(newest, last_ts)
-            tot = blank()
-            for u in bm.values():
-                for k, v in u.items():
-                    tot[k] += v; run_total[k] += v
+            tot = total_usage(bm, into=run_total)
             aid = Path(af).stem.replace("agent-", "")
             rows.append({"id": aid, "model": last_model, "usage": tot,
                          "ts": last_ts, "state": states.get(aid, "running"),
-                         "label": label_of(aid) or f"({aid[:8]})"})
+                         "label": label_of(aid)})
         # Most recently active first: the freshest work is anchored to the top
         # of the window and elision eats from the bottom.
         rows.sort(key=lambda r: -r["ts"])
-        out.append({"rid": rid, "session": p.name, "states": states,
+        out.append({"rid": rid, "name": live_run_name(p, rid),
+                    "session": p.name, "states": states,
                     "rows": rows, "total": run_total, "newest": newest})
     return out
 
@@ -1058,7 +1180,7 @@ def render_live_run(run, cols, budget=None):
     """Lines for one in-flight workflow run, elided to `budget` rows."""
     states, rows = run["states"], run["rows"]
     idle = time.time() - run["newest"] if run["newest"] else None
-    flag = "⚠ stalled?" if (idle and idle > 90) else "● active"
+    flag = "⚠ stalled?" if (idle and idle > STALL_AFTER) else "● active"
     lines = [fit(f"══ {run['rid']}  [{flag}]  {run['session']}", cols)]
 
     n = lambda st: sum(1 for s in states.values() if s == st)  # noqa: E731
@@ -1067,7 +1189,7 @@ def render_live_run(run, cols, budget=None):
     if n("orphaned"):
         agents += f" / {n('orphaned')} orphaned"
     t = run["total"]
-    fields = [agents, f"tokens: in {h(t['in'])}  out {h(t['out'])}  "
+    fields = [agents, f"tokens: in {h(t['input'])}  out {h(t['output'])}  "
                       f"cache-r {h(t['cache_read'])}"]
     if idle is not None:
         fields.append(f"last write: {int(idle)}s ago")
@@ -1082,8 +1204,9 @@ def render_live_run(run, cols, budget=None):
         it = f"{int(time.time()-r['ts'])}s" if r["ts"] else "-"
         u = r["usage"]
         lines.append(render_row(LIVE_SPEC, keep, flex, {
-            "LABEL": r["label"], "MODEL": str(r["model"]), "OUT": h(u["out"]),
-            "IN": h(u["in"]), "CACHE-R": h(u["cache_read"]),
+            "LABEL": r["label"] or f"({r['id'][:8]})", "MODEL": str(r["model"]),
+            "OUT": h(u["output"]),
+            "IN": h(u["input"]), "CACHE-R": h(u["cache_read"]),
             "TURNS": u["turns"], "IDLE": it, "STATE": r["state"],
             "AGENT": r["id"][:8]}, indent="   ", cols=cols))
     lines += _elision_note(hidden, cols)
@@ -1101,7 +1224,7 @@ def render_session_agents(sess, cols, budget=None):
     lines = [fit(f"══ subagents  [{n_run} in flight]  {sess['session']}", cols)]
     t = sess["total"]
     fields = [f"agents: {len(rows)} active / {n_run} in-flight",
-              f"tokens: in {h(t['in'])}  out {h(t['out'])}  cache-r {h(t['cache_read'])}"]
+              f"tokens: in {h(t['input'])}  out {h(t['output'])}  cache-r {h(t['cache_read'])}"]
     if idle is not None:
         fields.append(f"last write: {int(idle)}s ago")
     lines += wrap_fields(fields, cols, indent="   ")
@@ -1113,8 +1236,9 @@ def render_session_agents(sess, cols, budget=None):
     for r in shown:
         u = r["usage"]
         lines.append(render_row(SUBAGENT_SPEC, keep, flex, {
-            "TASK": r["label"], "TYPE": r["type"], "MODEL": str(r["model"]),
-            "OUT": h(u["out"]), "IN": h(u["in"]), "TURNS": u["turns"],
+            "TASK": r["label"] or "(no description)", "TYPE": r["type"],
+            "MODEL": str(r["model"]),
+            "OUT": h(u["output"]), "IN": h(u["input"]), "TURNS": u["turns"],
             "IDLE": f"{int(time.time()-r['ts'])}s" if r["ts"] else "-",
             "STATE": r["state"], "AGENT": r["id"][:8]}, indent="   ", cols=cols))
     lines += _elision_note(hidden, cols)
@@ -1130,8 +1254,39 @@ def live_blocks(pdirs):
     return blocks
 
 
+def live_json(blocks):
+    """The public shape of `live`: workflow runs and subagent sessions as two
+    lists, each most recently active first, with epoch times made ISO."""
+    runs, sessions = [], []
+    for render, d in blocks:
+        if render is render_live_run:
+            idle = _idle(d["newest"])
+            runs.append({
+                "run_id": d["rid"], "name": d["name"], "session": d["session"],
+                "status": "stalled" if idle is not None and idle > STALL_AFTER
+                          else "active",
+                "last_activity_at": _iso(d["newest"]), "idle_s": idle,
+                "agent_states": _state_counts(d["states"]), "usage": d["total"],
+                "agents": [{"agent_id": r["id"], "label": r["label"],
+                            "model": r["model"], "state": r["state"],
+                            "usage": r["usage"], "last_activity_at": _iso(r["ts"]),
+                            "idle_s": _idle(r["ts"])} for r in d["rows"]]})
+        else:
+            sessions.append({
+                "session": d["session"], "last_activity_at": _iso(d["newest"]),
+                "idle_s": _idle(d["newest"]), "usage": d["total"],
+                "agents": [{"agent_id": r["id"], "description": r["label"],
+                            "type": r["type"], "model": r["model"],
+                            "state": r["state"], "usage": r["usage"],
+                            "last_activity_at": _iso(r["ts"]),
+                            "idle_s": _idle(r["ts"])} for r in d["rows"]]})
+    return {"window_s": LIVE_WINDOW, "runs": runs, "subagents": sessions}
+
+
 def cmd_live(args):
     blocks = live_blocks(project_dirs(args))
+    if args.json:
+        return emit_json(live_json(blocks))
     cols, _rows = term_size()
     if not blocks:
         print("\n".join(wrap_text(NO_LIVE, cols)))
@@ -1217,6 +1372,9 @@ def cmd_watch(args):
     HIDE, SHOW = "\033[?25l", "\033[?25h"
     ALT_ON, ALT_OFF = "\033[?1049h", "\033[?1049l"
     SYNC_ON, SYNC_OFF = "\033[?2026h", "\033[?2026l"
+    if args.json:
+        sys.exit("watch is a display; for machine-readable output poll "
+                 "`wfstat live --json` instead")
     pdirs = project_dirs(args)
     out, frame, last = sys.stdout, "", None
     out.write(ALT_ON + HIDE)   # the first frame clears (last is None => resized)
@@ -1245,11 +1403,23 @@ def cmd_watch(args):
 
 
 def main():
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--project", help="project abs path or encoded dir name")
-    common.add_argument("--all", action="store_true", help="scan all projects")
+    def global_flags(suppress):
+        # Accepted before or after the subcommand. The subcommand's copies
+        # default to SUPPRESS: a plain default there would overwrite whatever
+        # was given before the subcommand, so `wfstat --json ls` lost its flag.
+        dflt = (lambda v: argparse.SUPPRESS) if suppress else (lambda v: v)
+        p = argparse.ArgumentParser(add_help=False)
+        p.add_argument("--project", default=dflt(None),
+                       help="project abs path or encoded dir name")
+        p.add_argument("--all", action="store_true", default=dflt(False),
+                       help="scan all projects")
+        p.add_argument("--json", action="store_true", default=dflt(False),
+                       help="print one JSON object instead of a table (ls/show/agent/live)")
+        return p
 
-    ap = argparse.ArgumentParser(prog="wfstat", description=__doc__, parents=[common],
+    common = global_flags(suppress=True)
+    ap = argparse.ArgumentParser(prog="wfstat", description=__doc__,
+                                 parents=[global_flags(suppress=False)],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"wfstat {__version__}")
     sub = ap.add_subparsers(dest="cmd")

@@ -599,6 +599,109 @@ class SubagentTest(FixtureCase):
         self.assertEqual(stamps, sorted(stamps, reverse=True))
 
 
+class JSONTest(FixtureCase):
+    """--json: one parseable document per command, carrying the same facts."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        session_subagent(cls.fx, "4444dddd", "summarise the logs", 4, finished=True)
+
+    def run_json(self, *args, cols=None):
+        doc = json.loads(self.run_cli(*args, "--json", cols=cols))
+        self.assertEqual(doc["schema"], 1)
+        return doc
+
+    def test_ls_lists_live_and_finished_runs_in_one_shape(self):
+        runs = self.run_json("ls")["runs"]
+        by_id = {r["run_id"]: r for r in runs}
+        self.assertEqual(runs[0]["run_id"], "wf_liverun0002")     # in-flight first
+        live, done = by_id["wf_liverun0002"], by_id["wf_donerun0001"]
+        self.assertEqual(set(live), set(done))                    # uniform records
+        self.assertTrue(live["live"])
+        self.assertEqual(live["name"], "migrate-verbs")
+        self.assertEqual(live["agent_states"], {"done": 0, "running": 1, "orphaned": 1})
+        self.assertEqual(live["total_tokens"], 800 + 140)
+        self.assertIsNone(live["duration_ms"])
+        self.assertFalse(done["live"])
+        self.assertEqual(done["status"], "halted")
+        self.assertEqual(done["raw_status"], "completed")
+        self.assertEqual(done["reason"], "spend limit reached after phase 2")
+        self.assertEqual(done["started_at"], "2025-06-15T15:06:40.000Z")
+        self.assertEqual(done["duration_ms"], 615_000)
+
+    def test_show_carries_exact_usage_and_labels(self):
+        d = self.run_json("show", "wf_done")
+        sonnet = d["usage"]["by_model"]["claude-sonnet-5"]
+        self.assertEqual(sonnet, {"input": 1500, "output": 500, "cache_read": 5000,
+                                  "cache_create": 100, "turns": 2})
+        self.assertEqual(d["usage"]["total"]["output"], 900)
+        self.assertEqual(d["usage"]["wire_input"], 3500 + 5000 + 100)
+        labels = {a["agent_id"]: a["label"] for a in d["agents"]}
+        self.assertEqual(labels, {"aaaa1111": "review:bugs", "bbbb2222": "verify:auth.py"})
+        self.assertEqual(d["agents"][0]["agent_id"], "aaaa1111")  # 500 out beats 400
+
+    def test_show_no_agents_omits_the_list(self):
+        self.assertNotIn("agents", self.run_json("show", "wf_done", "--no-agents"))
+
+    def test_show_on_a_live_run(self):
+        d = self.run_json("show", "wf_liverun0002")
+        self.assertTrue(d["live"])
+        self.assertEqual(d["name"], "migrate-verbs")
+        self.assertIsNone(d["agents"][0]["label"])     # unknown is null, not "(id)"
+
+    def test_agent_result_stays_structured_and_paths_stay_whole(self):
+        d = self.run_json("agent", "aaaa")
+        self.assertEqual(d["kind"], "workflow")
+        self.assertEqual(d["result"], {"findings": 3})     # JSON, not a string
+        self.assertEqual(d["files"], {"/tmp/demo-project/src/auth.py": 1})
+        self.assertEqual(d["bash"], ["pytest -q"])
+        self.assertEqual(d["label"], "review:bugs")
+        self.assertEqual(d["usage"]["turns"], 2)
+
+    def test_agent_on_a_session_subagent(self):
+        d = self.run_json("agent", "4444dddd")
+        self.assertEqual(d["kind"], "subagent")
+        self.assertIsNone(d["run_id"])
+        self.assertEqual(d["label"], "summarise the logs")
+        self.assertEqual(d["state"], "done")
+        self.assertEqual(d["result"], "Final answer: 42.")
+
+    def test_live_reports_states_and_subagents(self):
+        d = self.run_json("live")
+        self.assertEqual(d["window_s"], wfstat.LIVE_WINDOW)
+        run = next(r for r in d["runs"] if r["run_id"] == "wf_liverun0002")
+        states = {a["agent_id"]: a["state"] for a in run["agents"]}
+        self.assertEqual(states, {"cccc3333": "orphaned", "dddd4444": "running"})
+        self.assertTrue(all(a["label"] is None for a in run["agents"]))
+        self.assertNotIn("wf_donerun0001", {r["run_id"] for r in d["runs"]})
+        subs = [a for s in d["subagents"] for a in s["agents"]]
+        self.assertIn("summarise the logs", {a["description"] for a in subs})
+
+    def test_json_is_never_clamped_to_the_terminal(self):
+        # A long label in a 40-column window would be clipped in a table.
+        self.assertEqual(self.run_json("agent", "bbbb", cols=40)["label"], "verify:auth.py")
+        self.assertEqual(self.run_json("show", "wf_done", cols=40)["name"], "review-changes")
+
+    def test_global_flags_work_before_the_subcommand_too(self):
+        env = dict(os.environ, CLAUDE_HOME=self.tmp.name)
+        for argv in (["--json", f"--project={ENCODED}", "ls"],
+                     [f"--project={ENCODED}", "ls", "--json"],
+                     ["--json", "ls", f"--project={ENCODED}"]):
+            p = subprocess.run([sys.executable, str(SCRIPT), *argv],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, msg=f"{argv}: {p.stderr}")
+            self.assertEqual(json.loads(p.stdout)["schema"], 1)
+
+    def test_watch_refuses_json(self):
+        env = dict(os.environ, CLAUDE_HOME=self.tmp.name)
+        p = subprocess.run([sys.executable, str(SCRIPT), "watch", "--json",
+                            f"--project={ENCODED}"], capture_output=True, text=True, env=env)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("live --json", p.stderr)
+        self.assertEqual(p.stdout, "")
+
+
 class UnitTest(unittest.TestCase):
     def test_encode_project(self):
         self.assertEqual(wfstat.encode_project(Path(PROJECT)), ENCODED)

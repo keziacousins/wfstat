@@ -10,6 +10,25 @@ change under us; when it does, the fix ships as a patch release.
 
 ## [Unreleased]
 
+### Added
+
+- `--json` on `ls`, `show`, `agent` and `live` prints one JSON object instead
+  of a table: never clipped to the window, `agent`'s task and result in full,
+  and a structured return value kept as JSON rather than flattened to text.
+  Every document carries `"schema": 1`, versioned separately from `wfstat`, so
+  consumers can refuse a shape they don't know. `watch` refuses `--json`.
+
+### Fixed
+
+- `--project` and `--all` were silently ignored when given *before* the
+  subcommand (`wfstat --project=X ls`): the subcommand's own defaults
+  overwrote them. Global flags now work on either side.
+
+### Changed
+
+- `show` on a live run now recovers agent labels through the resume-cache key,
+  as `live` already did, rather than showing bare agent ids.
+
 ## [1.2.1] — 2026-09-26
 
 ### Fixed
