@@ -30,7 +30,7 @@ from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 CLAUDE = Path(os.environ.get("CLAUDE_HOME", Path.home() / ".claude"))
 PROJECTS = CLAUDE / "projects"

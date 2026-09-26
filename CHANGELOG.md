@@ -10,6 +10,10 @@ change under us; when it does, the fix ships as a patch release.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-09-26
+
+Also carries the fixes prepared as 1.2.1, which was never tagged.
+
 ### Added
 
 - `--json` on `ls`, `show`, `agent` and `live` prints one JSON object instead
@@ -17,19 +21,6 @@ change under us; when it does, the fix ships as a patch release.
   and a structured return value kept as JSON rather than flattened to text.
   Every document carries `"schema": 1`, versioned separately from `wfstat`, so
   consumers can refuse a shape they don't know. `watch` refuses `--json`.
-
-### Fixed
-
-- `--project` and `--all` were silently ignored when given *before* the
-  subcommand (`wfstat --project=X ls`): the subcommand's own defaults
-  overwrote them. Global flags now work on either side.
-
-### Changed
-
-- `show` on a live run now recovers agent labels through the resume-cache key,
-  as `live` already did, rather than showing bare agent ids.
-
-## [1.2.1] — 2026-09-26
 
 ### Fixed
 
@@ -48,6 +39,14 @@ change under us; when it does, the fix ships as a patch release.
   now always parsed whole.
 - Transcripts are decoded as UTF-8 regardless of locale, and invalid bytes no
   longer take a command down. File handles are no longer leaked.
+- `--project` and `--all` were silently ignored when given *before* the
+  subcommand (`wfstat --project=X ls`): the subcommand's own defaults
+  overwrote them. Global flags now work on either side.
+
+### Changed
+
+- `show` on a live run now recovers agent labels through the resume-cache key,
+  as `live` already did, rather than showing bare agent ids.
 
 ## [1.2.0] — 2026-08-02
 
@@ -130,8 +129,8 @@ First tagged release; `wfstat` extracted into a standalone repository.
   resume-cache `key`, which also recovers labels for live agents.
 - CI on Linux and macOS across Python 3.9, 3.11 and 3.13.
 
-[Unreleased]: https://github.com/keziacousins/wfstat/compare/v1.2.1...HEAD
-[1.2.1]: https://github.com/keziacousins/wfstat/compare/v1.2.0...v1.2.1
+[Unreleased]: https://github.com/keziacousins/wfstat/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/keziacousins/wfstat/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/keziacousins/wfstat/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/keziacousins/wfstat/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/keziacousins/wfstat/releases/tag/v1.0.0
