@@ -22,11 +22,11 @@ the window narrows, status lines wrap rather than lose fields, and `watch` clamp
 each frame to the window (a frame that scrolls corrupts the in-place repaint).
 Redirected output is left unclamped; set $COLUMNS to pin a width.
 """
-import json, os, sys, glob, time, argparse, shutil
+import json, os, re, sys, glob, time, argparse, shutil
 from pathlib import Path
 from collections import defaultdict
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 CLAUDE = Path(os.environ.get("CLAUDE_HOME", Path.home() / ".claude"))
 PROJECTS = CLAUDE / "projects"
@@ -34,8 +34,9 @@ PROJECTS = CLAUDE / "projects"
 
 # ---- location -------------------------------------------------------------
 def encode_project(path: Path) -> str:
-    # Claude encodes the abs project path by replacing every non-alnum run with '-'.
-    return "-" + str(path).strip("/").replace("/", "-")
+    # Claude encodes the abs project path by replacing every non-alnum char with
+    # '-' — not just the slashes, so /a/my.proj_x is -a-my-proj-x.
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
 def project_dirs(args):
@@ -77,27 +78,19 @@ def scan_agent_file(path):
     by_model = defaultdict(blank)
     last_ts = 0.0
     last_model = None
-    try:
-        with open(path) as fh:
-            for ln in fh:
-                try:
-                    d = json.loads(ln)
-                except Exception:
-                    continue
-                if d.get("type") != "assistant":
-                    continue
-                msg = d.get("message") or {}
-                model = msg.get("model")
-                usage = msg.get("usage")
-                ts = d.get("timestamp")
-                if ts:
-                    last_ts = max(last_ts, _epoch(ts))
-                if not usage or not model or model == "<synthetic>":
-                    continue
-                add_usage(by_model[model], usage)
-                last_model = model
-    except FileNotFoundError:
-        pass
+    for d in _iter_json(path):
+        if d.get("type") != "assistant":
+            continue
+        msg = d.get("message") or {}
+        model = msg.get("model")
+        usage = msg.get("usage")
+        ts = d.get("timestamp")
+        if ts:
+            last_ts = max(last_ts, _epoch(ts))
+        if not usage or not model or model == "<synthetic>":
+            continue
+        add_usage(by_model[model], usage)
+        last_model = model
     return by_model, last_ts, last_model
 
 
@@ -153,15 +146,37 @@ def _short_path(fp, keep=3):
 
 
 def _iter_json(path):
+    """Yield each parseable JSON line of a .jsonl file.
+
+    These files are appended to while runs are live, so a torn last line is
+    routine, not corruption — it is skipped, never raised. Decoding is pinned
+    to UTF-8 (what Claude Code writes) rather than the locale's, and invalid
+    bytes are replaced, so a C locale can't take a command down either."""
     try:
-        with open(path) as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             for ln in fh:
                 try:
-                    yield json.loads(ln)
-                except Exception:
+                    d = json.loads(ln)
+                except ValueError:
                     continue
-    except FileNotFoundError:
+                if isinstance(d, dict):     # every caller expects an object
+                    yield d
+    except OSError:
         return
+
+
+def load_summary(path):
+    """A run summary (wf_*.json) as a dict, or None.
+
+    Read whole with json.load — never line by line: nothing promises the
+    engine writes it on one line, and a pretty-printed summary would otherwise
+    parse as nothing at all, silently dropping every label it carries."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
 
 
 def journal_result(rundir, agent_id):
@@ -216,9 +231,8 @@ def summaries(pdirs):
     for p in pdirs:
         # workflows/ lives under each session dir: <project>/<session>/workflows/
         for f in glob.glob(str(p / "*" / "workflows" / "wf_*.json")):
-            try:
-                d = json.load(open(f))
-            except Exception:
+            d = load_summary(f)
+            if d is None:
                 continue
             out.append((d.get("runId", Path(f).stem), Path(f), d, Path(f).parents[1]))
     out.sort(key=lambda t: t[2].get("startTime", 0), reverse=True)
@@ -320,9 +334,11 @@ def subagent_meta(path):
     the only human-readable name they ever get — workflow agents get theirs
     from the run summary instead."""
     try:
-        return json.load(open(str(path)[:-len(".jsonl")] + ".meta.json"))
+        with open(str(path)[:-len(".jsonl")] + ".meta.json", encoding="utf-8") as fh:
+            d = json.load(fh)
     except (OSError, ValueError):
         return {}
+    return d if isinstance(d, dict) else {}
 
 
 def subagent_state(path):
@@ -400,14 +416,15 @@ def live_run_name(session_dir, rid):
     mj = session_dir.parent / f"{session_dir.name}.jsonl"
     names, near = [], None
     try:
-        for ln in open(mj):
-            if '"workflowName"' not in ln:
-                continue
-            for m in _findall_wfname(ln):
-                names.append(m)
-                if rid in ln:
-                    near = m
-    except FileNotFoundError:
+        with open(mj, encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                if '"workflowName"' not in ln:
+                    continue
+                for m in _findall_wfname(ln):
+                    names.append(m)
+                    if rid in ln:
+                        near = m
+    except OSError:
         pass
     if near:
         return near
@@ -429,7 +446,9 @@ def _findall_wfname(line):
 
 def live_run_stats(rundir):
     """Aggregate live token/agent stats for one in-flight run dir."""
-    started, result = _journal_counts(rundir)
+    # The same classification `live` uses, so the two commands can't disagree:
+    # an agent superseded by a restart is orphaned, not still outstanding.
+    states, result = journal_states(rundir)
     run_total = blank()
     rows, newest = [], 0.0
     for af in sorted(glob.glob(str(rundir / "agent-*.jsonl"))):
@@ -443,7 +462,7 @@ def live_run_stats(rundir):
         aid = Path(af).stem.replace("agent-", "")
         rows.append((aid, last_model, tot, last_ts, aid in result))
     models = sorted({m for _a, m, _u, _t, _d in rows if m})
-    return {"started": started, "result": result, "rows": rows,
+    return {"states": states, "result": result, "rows": rows,
             "total": run_total, "newest": newest, "models": models}
 
 
@@ -686,7 +705,7 @@ def cmd_ls(args):
         print(render_row(LS_SPEC, keep, flex, {
             "RUN": rid, "NAME": live_run_name(p, rid), "STATUS": status,
             "WHEN": ago(s["newest"] * 1000) if s["newest"] else "-", "DUR": "—",
-            "AGENTS": f"{len(s['result'])}/{len(s['started'])}",
+            "AGENTS": _agents_cell(s["states"]),
             "TOKENS": h(tok), "MODEL": model}, cols=cols))
 
     for rid, _f, d, _p in rows:
@@ -706,6 +725,14 @@ def cmd_ls(args):
         [f"{n} run(s){extra}.",
          "`wfstat show <run>` for tokens · `wfstat live` for live agents."],
         cols, sep=" ")))
+
+
+def _agents_cell(states):
+    """`done/outstanding` for a live run in `ls`. Orphaned agents are left out
+    of the denominator: a restart re-issued their step under a new id, which is
+    already counted, so counting the corpse too reads as work still owed."""
+    done = sum(1 for s in states.values() if s == "done")
+    return f"{done}/{done + sum(1 for s in states.values() if s == 'running')}"
 
 
 def _resolve(pdirs, prefix):
@@ -812,13 +839,13 @@ def _agent_meta(rundir, agent_id):
     """label / phase / model / state from the run summary's workflowProgress."""
     rid = rundir.name
     # rundir = <session>/subagents/workflows/wf_XXX  → summary at <session>/workflows/
-    summ = rundir.parents[2] / "workflows" / f"{rid}.json"
-    for d in _iter_json(summ):
-        for e in d.get("workflowProgress", []):
-            if e.get("agentId") == agent_id:
-                return e, rid, d.get("workflowName")
-        return None, rid, d.get("workflowName")  # summary exists, no match
-    return None, rid, None  # no summary (live run)
+    d = load_summary(rundir.parents[2] / "workflows" / f"{rid}.json")
+    if d is None:
+        return None, rid, None  # no summary (live run)
+    for e in d.get("workflowProgress", []):
+        if e.get("agentId") == agent_id:
+            return e, rid, d.get("workflowName")
+    return None, rid, d.get("workflowName")  # summary exists, no match
 
 
 def _last_assistant_text(path):
@@ -907,22 +934,6 @@ def _squeeze(text, full, cap):
     return text[:cap] + f"\n  … (+{len(text)-cap} chars; --full for all)"
 
 
-def _journal_counts(rundir):
-    started = set(); result = set()
-    jf = rundir / "journal.jsonl"
-    try:
-        for ln in open(jf):
-            d = json.loads(ln)
-            aid = d.get("agentId")
-            if d.get("type") == "started":
-                started.add(aid)
-            elif d.get("type") == "result":
-                result.add(aid)
-    except FileNotFoundError:
-        pass
-    return started, result
-
-
 def journal_states(rundir):
     """Classify every started agent as done / running / orphaned.
 
@@ -963,11 +974,10 @@ def live_label_map(rundir):
     old agentIds to new ones. Genuinely new steps have no label anywhere yet
     and fall through to None."""
     labels = {}
-    summ = rundir.parents[2] / "workflows" / f"{rundir.name}.json"
-    for d in _iter_json(summ):
-        for e in d.get("workflowProgress", []):
-            if e.get("agentId") and e.get("label"):
-                labels[e["agentId"]] = e["label"]
+    d = load_summary(rundir.parents[2] / "workflows" / f"{rundir.name}.json") or {}
+    for e in d.get("workflowProgress", []):
+        if e.get("agentId") and e.get("label"):
+            labels[e["agentId"]] = e["label"]
     agent_key = {}
     for d in _iter_json(rundir / "journal.jsonl"):
         if d.get("agentId") and d.get("key"):

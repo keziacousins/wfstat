@@ -10,6 +10,26 @@ change under us; when it does, the fix ships as a patch release.
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-09-26
+
+### Fixed
+
+- `ls` crashed with a `JSONDecodeError` when it caught a run journal mid-append.
+  Journals are written to while runs are live, so a torn last line is routine;
+  it is now skipped, as it already was everywhere else.
+- Projects whose path contains anything but letters, digits and slashes — a
+  `.`, `_` or space — were never found, by auto-detection or by `--project`.
+  Claude Code replaces *every* non-alphanumeric character with `-`, and
+  `wfstat` only replaced the slashes.
+- `ls` counted orphaned agents as outstanding, so after a stop-and-restart it
+  reported `0/2` for a run that `live` correctly showed as one agent in flight.
+  Both commands now share one classification, and `ls` leaves orphans out.
+- Agent labels and workflow names were read from the run summary line by line,
+  so a pretty-printed summary would have silently yielded none. The summary is
+  now always parsed whole.
+- Transcripts are decoded as UTF-8 regardless of locale, and invalid bytes no
+  longer take a command down. File handles are no longer leaked.
+
 ## [1.2.0] — 2026-08-02
 
 ### Added
@@ -91,7 +111,8 @@ First tagged release; `wfstat` extracted into a standalone repository.
   resume-cache `key`, which also recovers labels for live agents.
 - CI on Linux and macOS across Python 3.9, 3.11 and 3.13.
 
-[Unreleased]: https://github.com/keziacousins/wfstat/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/keziacousins/wfstat/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/keziacousins/wfstat/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/keziacousins/wfstat/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/keziacousins/wfstat/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/keziacousins/wfstat/releases/tag/v1.0.0
