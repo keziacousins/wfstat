@@ -184,6 +184,14 @@ class CLITest(FixtureCase):
         line = next(l for l in out.splitlines() if "wf_donerun0001" in l)
         self.assertIn("halted", line)
 
+    def test_ls_agent_count_leaves_orphans_out_like_live_does(self):
+        # The live run has one orphaned agent and one in flight: `live` calls
+        # that nothing done of one outstanding, so `ls` must not say 0/2.
+        out = self.run_cli("ls")
+        line = next(l for l in out.splitlines() if "wf_liverun0002" in l)
+        self.assertIn(" 0/1 ", line)
+        self.assertNotIn("0/2", line)
+
     def test_ls_names_live_run_from_session_transcript(self):
         out = self.run_cli("ls")
         line = next(l for l in out.splitlines() if "wf_liverun0002" in l)
@@ -493,6 +501,61 @@ class LivenessTest(FixtureCase):
             summ.unlink()
 
 
+class TornWriteTest(FixtureCase):
+    """Files are read while the engine is still appending to them."""
+
+    def test_a_half_written_journal_line_does_not_crash_ls(self):
+        rd = self.fx.rundir("wf_tornjournal5")
+        jsonl(rd / "agent-9999aaaa.jsonl", [
+            assistant("claude-sonnet-5", iso(2), input_tokens=10, output_tokens=5)])
+        with open(rd / "journal.jsonl", "w") as fh:
+            fh.write(json.dumps({"type": "started", "agentId": "9999aaaa"}) + "\n")
+            fh.write('{"type": "result", "agentId": "99')      # mid-append
+        out = self.run_cli("ls")
+        line = next(l for l in out.splitlines() if "wf_tornjournal5" in l)
+        self.assertIn("0/1", line)
+        self.assertIn("wf_tornjournal5", self.run_cli("live"))
+
+    def test_invalid_utf8_in_a_transcript_is_not_fatal(self):
+        rd = self.fx.rundir("wf_badbytes0006")
+        jsonl(rd / "journal.jsonl", [{"type": "started", "agentId": "8888bbbb"}])
+        jsonl(rd / "agent-8888bbbb.jsonl", [
+            {"type": "user", "message": {"content": "task"}},
+            assistant("claude-sonnet-5", iso(2), input_tokens=10, output_tokens=5)])
+        with open(rd / "agent-8888bbbb.jsonl", "ab") as fh:
+            fh.write(b'{"type": "user", "message": {"content": "\xff\xfe"}}\n')
+        env = dict(os.environ, CLAUDE_HOME=self.tmp.name, LC_ALL="C", LANG="C",
+                   PYTHONUTF8="0", PYTHONIOENCODING="utf-8")
+        for cmd in (("ls",), ("live",), ("agent", "8888bbbb")):
+            p = subprocess.run([sys.executable, str(SCRIPT), *cmd, f"--project={ENCODED}"],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, msg=f"{cmd}: {p.stderr}")
+
+
+class PrettySummaryTest(FixtureCase):
+    """Nothing promises a run summary is written on one line."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        summ = cls.fx.session / "workflows" / "wf_donerun0001.json"
+        mtime = os.path.getmtime(summ)
+        with open(summ) as fh:
+            d = json.load(fh)
+        with open(summ, "w") as fh:
+            json.dump(d, fh, indent=2)
+        os.utime(summ, (mtime, mtime))      # keep it postdating the journal
+
+    def test_agent_finds_its_label_in_a_pretty_printed_summary(self):
+        out = self.run_cli("agent", "aaaa1111")
+        self.assertIn("review:bugs", out)
+        self.assertIn("review-changes", out)
+
+    def test_live_labels_bridge_through_a_pretty_printed_summary(self):
+        label_of = wfstat.live_label_map(self.fx.rundir("wf_donerun0001"))
+        self.assertEqual(label_of("bbbb2222"), "verify:auth.py")
+
+
 class SubagentTest(FixtureCase):
     """Agent-tool subagents: the ones that are not part of any workflow."""
 
@@ -539,6 +602,28 @@ class SubagentTest(FixtureCase):
 class UnitTest(unittest.TestCase):
     def test_encode_project(self):
         self.assertEqual(wfstat.encode_project(Path(PROJECT)), ENCODED)
+
+    def test_encode_project_replaces_every_non_alnum_char(self):
+        # Not just the slashes: dots, underscores and spaces all become '-',
+        # one for one, so a dotfile directory yields a double dash.
+        self.assertEqual(wfstat.encode_project(Path("/home/me/my.proj_x")),
+                         "-home-me-my-proj-x")
+        self.assertEqual(wfstat.encode_project(Path("/Users/me/.config/a b")),
+                         "-Users-me--config-a-b")
+
+    def test_project_is_autodetected_for_a_dotted_path(self):
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory(suffix=".dotted_dir") as proj:
+            proj = os.path.realpath(proj)
+            # Spelled out here rather than via encode_project, so the test
+            # can't agree with a wrong encoder by construction.
+            enc = "".join(c if c.isascii() and c.isalnum() else "-" for c in proj)
+            (Path(home) / "projects" / enc).mkdir(parents=True)
+            env = dict(os.environ, CLAUDE_HOME=home)
+            p = subprocess.run([sys.executable, str(SCRIPT), "ls"], cwd=proj,
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, msg=p.stderr)
+            self.assertIn("no workflow runs found", p.stdout)
 
     def test_effective_status_trusts_result_over_status(self):
         st, reason = wfstat.effective_status(
